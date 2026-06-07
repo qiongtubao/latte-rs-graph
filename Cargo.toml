@@ -1,0 +1,47 @@
+[package]
+name = "latte-rs-graph"
+version = "0.1.0"
+edition = "2024"
+description = "Universal code graph library with swappable backend engines"
+keywords = ["code-graph", "code-analysis", "tree-sitter", "static-analysis"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+thiserror = "2"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Storage
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# Tree-sitter
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-javascript = "0.25"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[lib]
+name = "latte_rs_graph"
+
+[[bin]]
+name = "lrg"
+path = "src/bin/main.rs"
