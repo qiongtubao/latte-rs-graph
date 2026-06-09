@@ -300,6 +300,157 @@ impl SqliteStorage {
     }
 
     // =====================================================================
+    // Per-file mutations (for incremental updates)
+    // =====================================================================
+
+    /// Delete all nodes whose `file_path` matches `relative_path`.
+    /// Returns the list of deleted node IDs so callers can clean up
+    /// inbound edges. Empty path is treated as "match all" — never call
+    /// with empty; the caller filters.
+    pub fn delete_nodes_for_file(&self, relative_path: &str) -> GraphResult<Vec<String>> {
+        let mut conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("SELECT id FROM nodes WHERE file_path = ?1")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![relative_path], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        if !ids.is_empty() {
+            tx.execute(
+                "DELETE FROM nodes WHERE file_path = ?1",
+                params![relative_path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Delete every edge whose `source` or `target` is one of `node_ids`.
+    /// Returns the count of rows removed. Safe to call with an empty slice.
+    pub fn delete_edges_involving(&self, node_ids: &[String]) -> GraphResult<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        // node_ids is bounded by the parser output of a single file
+        // (rarely > 10k), and SQLite caps host parameters at 999.
+        // Chunk to stay under that limit.
+        const CHUNK: usize = 500;
+        let mut total = 0usize;
+        for chunk in node_ids.chunks(CHUNK) {
+            // Build two distinct placeholder lists — one for source, one
+            // for target — and a single parameter vector that lays them
+            // out in the same order the SQL sees them: [id0..idN, id0..idN].
+            let n = chunk.len();
+            let src_ph = std::iter::repeat("?")
+                .take(n)
+                .collect::<Vec<_>>()
+                .join(",");
+            let tgt_ph = std::iter::repeat("?")
+                .take(n)
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "DELETE FROM edges WHERE source IN ({src_ph}) OR target IN ({tgt_ph})"
+            );
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(n * 2);
+            for id in chunk {
+                params_vec.push(id);
+            }
+            for id in chunk {
+                params_vec.push(id);
+            }
+            let removed = conn.execute(&sql, params_vec.as_slice())?;
+            total += removed;
+        }
+        Ok(total)
+    }
+
+    /// Delete every edge whose `source` is exactly `source_id`. Used by
+    /// the incremental update path to drop a file's *outbound* edges
+    /// (those emitted by the parser with `source = file:<relative>`)
+    /// without disturbing inbound edges from other files.
+    pub fn delete_edges_with_source(&self, source_id: &str) -> GraphResult<usize> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let n = conn.execute(
+            "DELETE FROM edges WHERE source = ?1",
+            params![source_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Get the per-file metadata record (mtime + content hash).
+    /// Returns None if the file was never indexed.
+    pub fn get_file_record(&self, path: &str) -> GraphResult<Option<FileRecord>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT path, language, mtime, content_hash, indexed_at FROM files WHERE path = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![path], |row| {
+            Ok(FileRecord {
+                path: row.get(0)?,
+                language: row.get(1)?,
+                mtime: row.get::<_, i64>(2)?,
+                content_hash: row.get(3)?,
+                indexed_at: row.get::<_, i64>(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(rec)) => Ok(Some(rec)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Delete the per-file metadata record.
+    pub fn delete_file_record(&self, path: &str) -> GraphResult<()> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        conn.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// List every file_path the graph has indexed. Used to detect
+    /// files that disappeared between full builds.
+    pub fn all_file_paths(&self) -> GraphResult<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare("SELECT path FROM files")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// List distinct source IDs of edges pointing TO any of `node_ids`.
+    /// Used after a file change to find inbound edges that need to be
+    /// re-resolved (the old target went away).
+    pub fn edge_sources_pointing_to(&self, node_ids: &[String]) -> GraphResult<Vec<String>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        const CHUNK: usize = 500;
+        let mut out: Vec<String> = Vec::new();
+        for chunk in node_ids.chunks(CHUNK) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT source FROM edges WHERE target IN ({})",
+                placeholders
+            );
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                params_vec.push(id);
+            }
+            let mut stmt = conn.prepare(&sql)?;
+            let rows =
+                stmt.query_map(params_vec.as_slice(), |row| row.get::<_, String>(0))?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    // =====================================================================
     // Read
     // =====================================================================
 
@@ -572,5 +723,179 @@ impl SqliteStorage {
             node_kinds,
             edge_kinds,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{EdgeKind, NodeKind};
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn fresh() -> (TempDir, SqliteStorage) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("g.db");
+        let s = SqliteStorage::open(&path).expect("open");
+        (dir, s)
+    }
+
+    fn mk_node(id: &str, file: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: file.to_string(),
+            language: "rust".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 1,
+            signature: None,
+            docstring: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    fn mk_edge(id: &str, source: &str, target: &str) -> Edge {
+        Edge {
+            id: id.to_string(),
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            metadata: None,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn delete_nodes_for_file_returns_ids_and_removes_rows() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:foo:L1", "src/a.rs")).unwrap();
+        s.upsert_node(&mk_node("function:bar:L2", "src/a.rs")).unwrap();
+        s.upsert_node(&mk_node("function:baz:L1", "src/b.rs")).unwrap();
+
+        let removed = s.delete_nodes_for_file("src/a.rs").unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"function:foo:L1".to_string()));
+        assert!(removed.contains(&"function:bar:L2".to_string()));
+
+        let remaining: Vec<_> = s
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(remaining, vec!["function:baz:L1".to_string()]);
+    }
+
+    #[test]
+    fn delete_edges_involving_clears_both_sides() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:a:L1", "src/a.rs")).unwrap();
+        s.upsert_node(&mk_node("function:b:L1", "src/b.rs")).unwrap();
+        s.upsert_node(&mk_node("function:c:L1", "src/c.rs")).unwrap();
+        s.upsert_edge(&mk_edge("e1", "function:a:L1", "function:b:L1")).unwrap();
+        s.upsert_edge(&mk_edge("e2", "function:b:L1", "function:c:L1")).unwrap();
+        s.upsert_edge(&mk_edge("e3", "function:c:L1", "function:a:L1")).unwrap();
+
+        let removed = s
+            .delete_edges_involving(&["function:b:L1".to_string()])
+            .unwrap();
+        assert_eq!(removed, 2);
+
+        // e3 (a -> c) should still be there: neither side is b.
+        let all = s.all_edges().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "e3");
+    }
+
+    #[test]
+    fn delete_edges_involving_handles_empty_input() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:a:L1", "src/a.rs")).unwrap();
+        s.upsert_edge(&mk_edge("e1", "function:a:L1", "function:b:L1")).unwrap();
+        let n = s.delete_edges_involving(&[]).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(s.all_edges().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_and_delete_file_record_roundtrip() {
+        let (_dir, s) = fresh();
+        let rec = FileRecord {
+            path: "src/main.rs".to_string(),
+            language: "rust".to_string(),
+            mtime: 100,
+            content_hash: "deadbeef".to_string(),
+            indexed_at: 200,
+        };
+        assert!(s.get_file_record("src/main.rs").unwrap().is_none());
+        s.upsert_file(&rec).unwrap();
+        let got = s.get_file_record("src/main.rs").unwrap().unwrap();
+        assert_eq!(got.path, rec.path);
+        assert_eq!(got.content_hash, rec.content_hash);
+        s.delete_file_record("src/main.rs").unwrap();
+        assert!(s.get_file_record("src/main.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn all_file_paths_lists_indexed_files() {
+        let (_dir, s) = fresh();
+        s.upsert_file(&FileRecord {
+            path: "a.rs".into(),
+            language: "rust".into(),
+            mtime: 0,
+            content_hash: String::new(),
+            indexed_at: 0,
+        })
+        .unwrap();
+        s.upsert_file(&FileRecord {
+            path: "b.rs".into(),
+            language: "rust".into(),
+            mtime: 0,
+            content_hash: String::new(),
+            indexed_at: 0,
+        })
+        .unwrap();
+        let mut paths = s.all_file_paths().unwrap();
+        paths.sort();
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn edge_sources_pointing_to_finds_inbound_refs() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:callee:L1", "src/lib.rs")).unwrap();
+        s.upsert_node(&mk_node("file:src/a.rs", "src/a.rs")).unwrap();
+        s.upsert_node(&mk_node("file:src/b.rs", "src/b.rs")).unwrap();
+        s.upsert_edge(&mk_edge(
+            "e1",
+            "file:src/a.rs",
+            "function:callee:L1",
+        ))
+        .unwrap();
+        s.upsert_edge(&mk_edge(
+            "e2",
+            "file:src/b.rs",
+            "function:callee:L1",
+        ))
+        .unwrap();
+        s.upsert_edge(&mk_edge("e3", "file:src/a.rs", "file:src/b.rs"))
+            .unwrap();
+
+        let mut srcs = s
+            .edge_sources_pointing_to(&["function:callee:L1".to_string()])
+            .unwrap();
+        srcs.sort();
+        assert_eq!(srcs, vec!["file:src/a.rs".to_string(), "file:src/b.rs".to_string()]);
     }
 }

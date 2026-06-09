@@ -13,13 +13,13 @@ use crate::types::*;
 // =============================================================================
 // Language Registration
 // =============================================================================
-
-struct LangConfig {
-    name: &'static str,
-    extensions: &'static [&'static str],
-    language: Language,
-    query: &'static str,
+pub(crate) struct LangConfig {
+    pub(crate) name: &'static str,
+    pub(crate) extensions: &'static [&'static str],
+    pub(crate) language: Language,
+    pub(crate) query: &'static str,
 }
+
 
 fn registered_languages() -> Vec<LangConfig> {
     vec![
@@ -73,6 +73,28 @@ impl TreeSitterEngine {
             langs: registered_languages(),
         }
     }
+
+    /// Find the language name (e.g. "rust") for a file based on its
+    /// extension. Returns None if the extension is not supported;
+    /// the caller should skip the file in that case.
+    pub fn lang_name_for_path(&self, path: &Path) -> Option<&'static str> {
+        let ext = path.extension()?.to_str()?;
+        self.langs
+            .iter()
+            .find(|l| l.extensions.iter().any(|e| *e == ext))
+            .map(|l| l.name)
+    }
+
+    /// Internal: look up the LangConfig by extension. Used by
+    /// `update_files` which needs the full config (query + language
+    /// binding) to call `parse_file`.
+    pub(crate) fn lang_for_path(&self, path: &Path) -> Option<&LangConfig> {
+        let ext = path.extension()?.to_str()?;
+        self.langs
+            .iter()
+            .find(|l| l.extensions.iter().any(|e| *e == ext))
+    }
+
 
     /// Parse a single source file, returning its nodes and edges.
     fn parse_file(
@@ -397,6 +419,156 @@ impl TreeSitterEngine {
 
         Ok(())
     }
+
+    /// Re-index a subset of files in place, without touching the rest of
+    /// the graph. This is the hot path used by the editor's file-watcher
+    /// driven incremental updates.
+    ///
+    /// For each path in `changed_paths`:
+    /// - If the file no longer exists on disk, every node/edge owned by
+    ///   that file is purged, including inbound call edges from other
+    ///   files. Their file record is removed.
+    /// - Otherwise the file is re-parsed; the previously indexed nodes
+    ///   and their incident edges are dropped, and the new nodes/edges
+    ///   are inserted in their place.
+    ///
+    /// At the end the reference resolver runs once to bind unresolved
+    /// call / heritage edges to their concrete targets. Resolver cost
+    /// is O(graph size); for very large graphs this dominates the
+    /// update and should be replaced with a file-scoped variant.
+    ///
+    /// Returns an `UpdateReport` summarising the work done. Errors
+    /// encountered while parsing a single file are recorded in
+    /// `error` and do not abort the rest of the batch.
+    pub async fn update_files(
+        &self,
+        project_root: &Path,
+        changed_paths: &[PathBuf],
+    ) -> GraphResult<UpdateReport> {
+        let start = Instant::now();
+        let mut nodes_added = 0usize;
+        let mut nodes_removed = 0usize;
+        let mut edges_rebuilt = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut changed_files = 0usize;
+
+        for raw_path in changed_paths {
+            // Normalise to absolute, then derive the project-relative
+            // path the rest of the storage layer expects.
+            let abs = if raw_path.is_absolute() {
+                raw_path.to_path_buf()
+            } else {
+                project_root.join(raw_path)
+            };
+            let relative = abs
+                .strip_prefix(project_root)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+
+            changed_files += 1;
+
+            if !abs.exists() {
+                // File disappeared: drop every node, edge, and file
+                // record we ever owned for it. Unlike a re-index, this
+                // is a full purge: inbound call edges from other
+                // files that pointed at the deleted symbols are now
+                // meaningless, so they have to go too.
+                let removed_ids = self.storage.delete_nodes_for_file(&relative)?;
+                nodes_removed += removed_ids.len();
+                let dropped = self.storage.delete_edges_involving(&removed_ids)?;
+                edges_rebuilt += dropped;
+                self.storage.delete_file_record(&relative)?;
+                continue;
+            }
+
+            // Language unknown for this extension: skip cleanly.
+            let Some(lang) = self.lang_for_path(&abs) else {
+                continue;
+            };
+
+            // Parse the new contents.
+            let (new_nodes, new_edges) = match self.parse_file(lang, &abs, project_root) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    errors.push(format!("{}: {}", relative, e));
+                    continue;
+                }
+            };
+
+            // Drop the old slice of the graph for this file: every
+            // node that lived there, plus the edges that *this file*
+            // emitted (source = file:<relative>). We deliberately
+            // leave inbound edges from other files alone — their
+            // target id is now stale, but re-parsing the caller
+            // will regenerate and re-resolve them on the next touch.
+            // See the test `update_files_keeps_call_edges_…` for
+            // the end-to-end behaviour.
+            // Drop the old slice of the graph for this file. We delete
+            // only *outbound* edges (source = file:<relative>); inbound
+            // call edges from other files keep their now-stale target
+            // id and will be regenerated when the caller is next
+            // touched and re-resolved by `resolve_references`.
+            let old_ids = self.storage.delete_nodes_for_file(&relative)?;
+            nodes_removed += old_ids.len();
+            let file_edge_source = format!("file:{relative}");
+            let dropped = self.storage.delete_edges_with_source(&file_edge_source)?;
+            edges_rebuilt += dropped;
+            // Insert the freshly parsed slice.
+            if let Err(e) = self.storage.upsert_nodes_batch(&new_nodes) {
+                errors.push(format!("{}: insert nodes: {}", relative, e));
+            }
+            nodes_added += new_nodes.len();
+            if let Err(e) = self.storage.upsert_edges_batch(&new_edges) {
+                errors.push(format!("{}: insert edges: {}", relative, e));
+            }
+            edges_rebuilt += new_edges.len();
+
+            // Update the file record so future skip-if-unchanged logic
+            // can compare mtime / hash.
+            let now = chrono::Utc::now().timestamp();
+            let mtime = std::fs::metadata(&abs)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let _ = self.storage.upsert_file(&FileRecord {
+                path: relative.clone(),
+                language: lang.name.to_string(),
+                mtime,
+                content_hash: String::new(), // hashes aren't computed yet
+                indexed_at: now,
+            });
+        }
+
+        // Re-resolve any newly added or dangling call/heritage edges.
+        // Cost is bounded by total node count; for projects > ~50k
+        // nodes this should be replaced with a file-scoped resolver.
+        if let Err(e) = self.resolve_references() {
+            errors.push(format!("resolve_references: {}", e));
+        }
+
+        let status = if errors.is_empty() {
+            UpdateStatus::Updated
+        } else {
+            UpdateStatus::Updated // partial success is still an update
+        };
+
+        Ok(UpdateReport {
+            status,
+            changed_files,
+            nodes_added,
+            nodes_removed,
+            edges_rebuilt,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: if errors.is_empty() {
+                None
+            } else {
+                Some(errors.join("; "))
+            },
+        })
+    }
 }
 
 #[async_trait]
@@ -654,5 +826,226 @@ fn extract_signature(content: &str, start_row: usize, _end_row: usize) -> Option
         None
     } else {
         Some(sig)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Helper: write a project with `files` (each a (path, content) pair)
+    /// and build a TreeSitterEngine over a fresh graph.db rooted there.
+    async fn bootstrap(files: &[(&str, &str)]) -> (TempDir, PathBuf, TreeSitterEngine) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        for (rel, content) in files {
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&p, content).unwrap();
+        }
+        let db = root.join("graph.db");
+        let storage = SqliteStorage::open(&db).unwrap();
+        let engine = TreeSitterEngine::new(storage);
+        // Run a full build so the baseline is established.
+        let opts = BuildOptions {
+            project_root: root.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        engine.build(&root, &opts).await.unwrap();
+        (dir, root, engine)
+    }
+
+    #[tokio::test]
+    async fn update_files_replaces_nodes_for_edited_file() {
+        let (_dir, root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\n",
+        )])
+        .await;
+
+        // Pre-condition: two function nodes for src/lib.rs.
+        let before = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.file_path == "src/lib.rs" && n.kind == NodeKind::Function)
+            .count();
+        assert_eq!(before, 2, "baseline build should produce 2 function nodes");
+
+        // Edit the file: rename alpha -> gamma, drop beta, add delta.
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn gamma() -> i32 { 1 }\npub fn delta() -> i32 { 3 }\n",
+        )
+        .unwrap();
+
+        let report = engine
+            .update_files(&root, &[PathBuf::from("src/lib.rs")])
+            .await
+            .unwrap();
+
+        assert_eq!(report.changed_files, 1);
+        assert!(report.nodes_removed >= 2, "old function nodes should be removed");
+        assert!(report.nodes_added >= 2, "new function nodes should be added");
+
+        let after: Vec<String> = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.file_path == "src/lib.rs" && n.kind == NodeKind::Function)
+            .map(|n| n.name)
+            .collect();
+        assert!(after.contains(&"gamma".to_string()));
+        assert!(after.contains(&"delta".to_string()));
+        assert!(!after.contains(&"alpha".to_string()), "alpha should be gone");
+        assert!(!after.contains(&"beta".to_string()), "beta should be gone");
+    }
+
+    #[tokio::test]
+    async fn update_files_purges_deleted_file() {
+        let (_dir, root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { 1 }\n",
+        )])
+        .await;
+
+        // Pre-condition: at least one function node belongs to src/lib.rs.
+        let before: Vec<_> = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.file_path == "src/lib.rs")
+            .collect();
+        assert!(!before.is_empty());
+
+        // Remove the file and run the update — the engine should
+        // notice the file is gone and purge the slice.
+        fs::remove_file(root.join("src/lib.rs")).unwrap();
+        let report = engine
+            .update_files(&root, &[PathBuf::from("src/lib.rs")])
+            .await
+            .unwrap();
+
+        assert_eq!(report.changed_files, 1);
+        assert!(report.nodes_removed >= 1);
+        let remaining: Vec<_> = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.file_path == "src/lib.rs")
+            .collect();
+        assert!(remaining.is_empty(), "no nodes should remain for deleted file");
+    }
+
+    #[tokio::test]
+    async fn update_files_keeps_call_edges_for_re_resolve_on_next_touch() {
+        // Two files: src/a.rs calls `target`, defined in src/b.rs.
+        let (_dir, root, engine) = bootstrap(&[
+            (
+                "src/a.rs",
+                "use crate::target;\npub fn caller() { target(); }\n",
+            ),
+            (
+                "src/b.rs",
+                "pub fn target() {}\n",
+            ),
+        ])
+        .await;
+
+        // After the initial build the resolver has bound the call.
+        let edges_before: Vec<String> = engine
+            .storage
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| e.target.clone())
+            .collect();
+        assert!(edges_before
+            .iter()
+            .any(|t| t.contains("target")),
+            "calls should already be resolved to target, got: {:?}",
+            edges_before);
+
+        // Rename `target` -> `renamed` in src/b.rs.
+        // After re-parsing src/b.rs the call edge from src/a.rs still
+        // points to the (now-stale) `function:target:L1` id, because
+        // the caller file wasn't re-parsed. That's an accepted
+        // trade-off: callers get re-bound the next time *they* are
+        // touched (or after a full rebuild).
+        fs::write(root.join("src/b.rs"), "pub fn renamed() {}\n").unwrap();
+        let _ = engine
+            .update_files(&root, &[PathBuf::from("src/b.rs")])
+            .await
+            .unwrap();
+        let edges_after_first: Vec<String> = engine
+            .storage
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| e.target.clone())
+            .collect();
+        // The call from src/a.rs survives; it's pointing at the old
+        // target id. No edge currently resolves to "renamed" yet.
+        assert!(
+            edges_after_first.iter().any(|t| t.contains("target")),
+            "stale call edge should still be present (will be re-resolved \
+             when src/a.rs is next touched)"
+        );
+
+        // Now touch src/a.rs (and update its content to call the new
+        // name) to trigger its re-parse. The resolver should re-bind
+        // the call to the new `renamed` symbol.
+        fs::write(
+            root.join("src/a.rs"),
+            "use crate::renamed;\npub fn caller() { renamed(); }\n",
+        )
+        .unwrap();
+        let _ = engine
+            .update_files(&root, &[PathBuf::from("src/a.rs")])
+            .await
+            .unwrap();
+
+        let edges_after_second: Vec<String> = engine
+            .storage
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| e.target.clone())
+            .collect();
+        assert!(
+            edges_after_second.iter().any(|t| t.contains("renamed")),
+            "edges should now resolve to renamed callee, got: {:?}",
+            edges_after_second
+        );
+    }
+
+    #[tokio::test]
+    async fn update_files_skips_unsupported_extension() {
+        let (_dir, root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { 1 }\n",
+        )])
+        .await;
+
+        // A markdown file is not a recognised language: should be
+        // ignored gracefully without dropping existing graph data.
+        let report = engine
+            .update_files(&root, &[PathBuf::from("README.md")])
+            .await
+            .unwrap();
+        assert_eq!(report.changed_files, 1);
+        assert_eq!(report.nodes_added, 0);
+        assert_eq!(report.nodes_removed, 0);
     }
 }
