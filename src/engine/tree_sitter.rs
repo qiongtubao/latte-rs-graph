@@ -362,11 +362,11 @@ impl TreeSitterEngine {
     ///    the call by checking line ranges.
     fn resolve_references(&self) -> GraphResult<()> {
         let all_nodes = self.storage.all_nodes()?;
-        let name_map: HashMap<&str, &Node> = all_nodes.iter().filter_map(|n| {
+        let mut name_map: HashMap<&str, Vec<&Node>> = HashMap::new();
+        for n in &all_nodes {
             let simple = n.name.split("::").last().unwrap_or(&n.name);
-            Some((simple, n))
-        })
-        .collect();
+            name_map.entry(simple).or_default().push(n);
+        }
 
         // Index nodes by file for container resolution
         let mut nodes_by_file: HashMap<&str, Vec<&Node>> = HashMap::new();
@@ -382,22 +382,42 @@ impl TreeSitterEngine {
             .collect();
 
         for mut edge in unresolved {
-            // Step 1: Resolve target
+            // Step 1: Resolve target name from wildcard format
             let target_name = if edge.target.starts_with('*') {
                 edge.target.split(':').last()
             } else {
                 edge.target.split(':').rev().nth(1)
             }.unwrap_or(&edge.target);
 
-            if let Some(target_node) = name_map.get(target_name) {
-                edge.target = target_node.id.clone();
+            if let Some(candidates) = name_map.get(target_name) {
+                let caller_path = if edge.source.starts_with("file:") {
+                    edge.source.strip_prefix("file:").unwrap_or("")
+                } else {
+                    ""
+                };
+                let caller_dir = std::path::Path::new(caller_path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+
+                // Pick best candidate: same file > same directory > first-encountered
+                let best = candidates.iter()
+                    .min_by_key(|n| {
+                        if n.file_path == caller_path { 0 }
+                        else if !caller_dir.is_empty()
+                            && n.file_path.starts_with(caller_dir)
+                        { 1 }
+                        else { 2 }
+                    })
+                    .copied()
+                    .unwrap_or(candidates[0]);
+
+                edge.target = best.id.clone();
 
                 // Step 2: Resolve source — if source is a file, find the containing function
                 if edge.source.starts_with("file:") {
-                    // Extract the file path
                     let file_path = edge.source.strip_prefix("file:").unwrap_or("");
                     if let Some(containers) = nodes_by_file.get(file_path) {
-                        // Find the function that contains the call line
                         for func_node in containers {
                             if func_node.kind != NodeKind::Function
                                 && func_node.kind != NodeKind::Method
@@ -792,9 +812,53 @@ impl GraphProvider for TreeSitterEngine {
 // =============================================================================
 // Helpers
 // =============================================================================
+/// Detect sibling git worktrees and extend the exclusion list so that
+/// walkdir does not descend into them. This prevents cross-worktree
+/// contamination when the build root happens to be the parent of
+/// multiple worktrees.
+fn extend_exclude_with_worktrees(root: &Path, exclude: &mut Vec<String>) {
+    // In the main repo .git is a directory; in a worktree .git is a file.
+    let git_dir = root.join(".git");
+    if !git_dir.is_dir() {
+        return;
+    }
 
+    let worktrees_dir = git_dir.join("worktrees");
+    if !worktrees_dir.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let gitdir_path = entry.path().join("gitdir");
+        let Ok(content) = std::fs::read_to_string(&gitdir_path) else {
+            continue;
+        };
+        let worktree_path = PathBuf::from(content.trim());
+        // If the worktree lives under root, exclude it by name
+        if let Ok(relative) = worktree_path.strip_prefix(root) {
+            if let Some(name) = relative.components().next() {
+                if let Some(name_str) = name.as_os_str().to_str() {
+                    if !exclude.iter().any(|p| p == name_str) {
+                        exclude.push(name_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Collect source files under `root` with the given `extensions`, skipping
+/// hidden entries, excluded directory names, and sibling git worktrees.
 fn collect_files(root: &Path, extensions: &[&str], exclude: &[String]) -> Vec<PathBuf> {
+    let mut exclude = exclude.to_vec();
+    extend_exclude_with_worktrees(root, &mut exclude);
+
     WalkDir::new(root)
+        .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
