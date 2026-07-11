@@ -2,9 +2,16 @@
 
 ; === Definitions ===
 
+; Direct function declarator: void createClient(...)
 (function_definition
   declarator: (function_declarator
     declarator: (identifier) @definition)
+  (#set! kind "function"))
+; Pointer function declarator: client *createClient(...)
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @definition))
   (#set! kind "function"))
 
 (struct_specifier
