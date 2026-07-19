@@ -934,8 +934,72 @@ impl GraphProvider for TreeSitterEngine {
     ) -> GraphResult<ArchitectureReport> {
         self.storage.architecture_overview(req)
     }
+
+    async fn cypher(&self, query: &str) -> GraphResult<CypherRows> {
+        let parsed =
+            crate::query::cypher::parse_cypher(query).map_err(GraphError::Config)?;
+        let rows = crate::query::cypher::execute_cypher(&parsed, &self.storage)?;
+        Ok(Self::flatten_cypher_rows(rows, &parsed))
+    }
 }
 
+impl TreeSitterEngine {
+    /// Collapse executor rows into the flat `CypherRows` shape the
+    /// trait (and the CLI JSON) emit. Column names come from
+    /// `RETURN` items, preserving the alias when one was given.
+    fn flatten_cypher_rows(
+        rows: Vec<crate::query::cypher::CypherRow>,
+        parsed: &crate::query::cypher::CypherQuery,
+    ) -> CypherRows {
+        let columns: Vec<String> = parsed
+            .return_clause
+            .items
+            .iter()
+            .map(|item| {
+                item.alias.clone().unwrap_or_else(|| match &item.expr {
+                    crate::query::cypher::ReturnExpr::Var(s) => s.clone(),
+                    crate::query::cypher::ReturnExpr::Property { var, prop } => {
+                        format!("{var}.{prop}")
+                    }
+                    crate::query::cypher::ReturnExpr::CountVar(s) => format!("count({s})"),
+                    crate::query::cypher::ReturnExpr::CountStar => "count(*)".to_string(),
+                })
+            })
+            .collect();
+        let flat_rows: Vec<Vec<CypherScalar>> = rows
+            .into_iter()
+            .map(|row| {
+                row.values
+                    .into_iter()
+                    .map(|(_, v)| value_to_scalar(v))
+                    .collect()
+            })
+            .collect();
+        let truncated = match parsed.limit {
+            Some(n) => flat_rows.len() >= n as usize,
+            None => false,
+        };
+        CypherRows {
+            columns,
+            rows: flat_rows,
+            truncated,
+        }
+    }
+}
+
+/// Convert the executor's `CypherValue` (typed payload) into the
+/// trait-facing `CypherScalar` (same shape, but used at the engine
+/// boundary so the JSON output stays stable across executor refactors).
+fn value_to_scalar(v: crate::query::cypher::CypherValue) -> CypherScalar {
+    match v {
+        crate::query::cypher::CypherValue::Node(n) => CypherScalar::Node(n),
+        crate::query::cypher::CypherValue::Str(s) => CypherScalar::Str(s),
+        crate::query::cypher::CypherValue::Int(n) => CypherScalar::Int(n),
+        crate::query::cypher::CypherValue::Float(f) => CypherScalar::Float(f),
+        crate::query::cypher::CypherValue::Bool(b) => CypherScalar::Bool(b),
+        crate::query::cypher::CypherValue::Null => CypherScalar::Null,
+    }
+}
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -1363,5 +1427,35 @@ mod tests {
             any_populated,
             "default set should populate at least one downstream aspect"
         );
+    }
+
+    /// Phase 5 — `cypher` round-trips through the trait and yields
+    /// at least one row per matching function node.
+    #[tokio::test]
+    async fn engine_cypher_via_trait() {
+        let (_dir, _root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { 1 }\npub fn beta() -> i32 { 2 }\npub fn caller() { alpha(); }\n",
+        )])
+        .await;
+
+        let report = engine
+            .cypher("MATCH (n:Function) RETURN n.name AS name")
+            .await
+            .unwrap();
+        // Three function nodes → three projected rows.
+        assert_eq!(report.rows.len(), 3);
+        assert_eq!(report.columns, vec!["name".to_string()]);
+        let mut names: Vec<String> = report
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                CypherScalar::Str(s) => s.clone(),
+                other => panic!("expected string scalar, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string(), "caller".to_string()]);
+        assert!(!report.truncated);
     }
 }

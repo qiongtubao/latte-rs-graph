@@ -8,7 +8,7 @@ use crate::types::*;
 
 /// SQLite-backed graph storage, aligned with @latte-graph/core schema.
 pub struct SqliteStorage {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 impl SqliteStorage {
@@ -485,6 +485,39 @@ impl SqliteStorage {
 
         let rows = stmt.query_map([], row_to_node)?;
 
+        let nodes: Vec<Node> = rows.collect::<Result<_, _>>()?;
+        Ok(nodes)
+    }
+
+    /// Run an arbitrary `SELECT` against the `nodes` table and materialise
+    /// each row back into a [`Node`]. Used by the Cypher planner to execute
+    /// the seed-fetch SQL it generated; callers are responsible for
+    /// ensuring the column ordering matches `row_to_node`.
+    ///
+    /// Binds are positional — the planner produces a `Vec<Literal>` in the
+    /// same order as the `?` placeholders it emitted. `Literal::Str` /
+    /// `Int` / `Float` / `Bool` / `Null` are converted to their rusqlite
+    /// counterparts; `Null` binds to a SQL NULL.
+    pub fn raw_query_nodes(
+        &self,
+        sql: &str,
+        binds: &[crate::query::cypher::ast::Literal],
+    ) -> GraphResult<Vec<Node>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare(sql)?;
+        let boxed: Vec<Box<dyn rusqlite::ToSql>> = binds
+            .iter()
+            .map(|l| -> Box<dyn rusqlite::ToSql> {
+                match l {
+                    crate::query::cypher::ast::Literal::Str(s) => Box::new(s.clone()),
+                    crate::query::cypher::ast::Literal::Int(n) => Box::new(*n),
+                    crate::query::cypher::ast::Literal::Float(f) => Box::new(*f),
+                    crate::query::cypher::ast::Literal::Bool(b) => Box::new(*b),
+                    crate::query::cypher::ast::Literal::Null => Box::new(rusqlite::types::Null),
+                }
+            })
+            .collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(boxed.iter()), row_to_node)?;
         let nodes: Vec<Node> = rows.collect::<Result<_, _>>()?;
         Ok(nodes)
     }

@@ -855,3 +855,33 @@ pub struct FileTreeEntry {
     pub kind: String,
     pub children: Vec<FileTreeEntry>,
 }
+
+
+// =============================================================================
+// Cypher rows (Phase 5)
+// =============================================================================
+//
+// The executor (`query::cypher::executor`) produces typed `CypherRow`
+// values keyed by variable name. The engine flattens those into this
+// columnar shape so the JSON output is easy to consume from any CLI.
+
+/// One Cypher query result, flattened to columns + rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CypherRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<CypherScalar>>,
+    /// True when the underlying query hit a `LIMIT` clause (so callers
+    /// can warn that more rows were available).
+    pub truncated: bool,
+}
+
+/// One cell in a [`CypherRows`] table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CypherScalar {
+    Node(Node),
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+}

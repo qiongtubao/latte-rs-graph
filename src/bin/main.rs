@@ -133,6 +133,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Execute a Cypher query against the graph and print the result
+    /// as JSON rows (Phase 5 subset).
+    Cypher {
+        /// Path to the graph database
+        db: PathBuf,
+        /// The Cypher query string. Wrap in quotes for multi-word queries.
+        query: String,
+    },
 }
 
 #[tokio::main]
@@ -467,8 +475,15 @@ async fn main() -> GraphResult<()> {
                 render_arch_report(&report);
             }
         }
+        Command::Cypher { db, query } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+            let report = engine.cypher(&query).await?;
+            let s = serde_json::to_string_pretty(&report)
+                .map_err(latte_rs_graph::error::GraphError::Serde)?;
+            println!("{s}");
+        }
      }
-
     Ok(())
 }
 

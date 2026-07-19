@@ -4,10 +4,10 @@ use std::path::Path;
 use crate::error::GraphResult;
 use crate::types::{
     ArchitectureReport, ArchitectureRequest, BlastDirection, BlastRadiusReport,
-    BuildOptions, BuildReport, ComplexityMetrics, DeadCodeReport, GraphData, GraphStats, Node,
-    RelationResult, SearchCodeRequest, SearchCodeResponse, SearchOptions, UpdateReport,
+    BuildOptions, BuildReport, ComplexityMetrics, CypherRows, DeadCodeReport, GraphData,
+    GraphStats, Node, RelationResult, SearchCodeRequest, SearchCodeResponse, SearchOptions,
+    UpdateReport,
 };
-
 /// Core trait that every graph engine must implement.
 ///
 /// Engines are swappable at runtime — the editor can choose between
@@ -106,6 +106,11 @@ pub trait GraphProvider: Send + Sync {
         &self,
         req: &ArchitectureRequest,
     ) -> GraphResult<ArchitectureReport>;
+
+    /// Run a Cypher query (Phase 5 subset) and return flattened
+    /// columnar rows. The engine is responsible for parsing and
+    /// execution; the storage layer only exposes the raw tables.
+    async fn cypher(&self, query: &str) -> GraphResult<CypherRows>;
 }
 
 /// Extension trait for engines that support community detection.
