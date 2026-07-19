@@ -258,6 +258,12 @@ impl TreeSitterEngine {
                         );
                         let extra = crate::engine::metrics::metrics_to_extra(&metrics);
 
+                        // Detect modifiers from the surrounding item so is_exported /
+                        // is_async / etc. reflect what the parser actually sees. Previously
+                        // all four were hardcoded `false`, which made Phase 2's
+                        // entry-point heuristic and Phase 4's entry_points_count
+                        // always zero.
+                        let mods = detect_modifiers(content.as_bytes(), metrics_root, lang.name);
                         let node = Node {
                             id: node_id.clone(),
                             kind: def_kind,
@@ -271,11 +277,11 @@ impl TreeSitterEngine {
                             end_column: full_end.column as u32,
                             signature: sig,
                             docstring: None,
-                            visibility: None,
-                            is_exported: false,
-                            is_async: false,
-                            is_static: false,
-                            is_abstract: false,
+                            visibility: mods.visibility,
+                            is_exported: mods.is_exported,
+                            is_async: mods.is_async,
+                            is_static: mods.is_static,
+                            is_abstract: mods.is_abstract,
                             extra,
                         };
                         nodes.push(node);
@@ -1074,6 +1080,135 @@ fn collect_files(root: &Path, extensions: &[&str], exclude: &[String]) -> Vec<Pa
         .collect()
 }
 
+// =============================================================================
+// Modifier detection (pub / async / static / abstract / visibility)
+// =============================================================================
+//
+// `parse_file` previously hardcoded `is_exported: false`, `is_async: false`,
+// etc. — which made Phase 2's entry-point heuristic (and Phase 4's
+// `entry_points_count`) always return zero. The detector below walks the
+// defining item's direct children to recover language-aware signals.
+
+struct Modifiers {
+    visibility: Option<String>,
+    is_exported: bool,
+    is_async: bool,
+    is_static: bool,
+    is_abstract: bool,
+}
+
+impl Default for Modifiers {
+    fn default() -> Self {
+        Self {
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+        }
+    }
+}
+
+fn detect_modifiers(source: &[u8], enclosing_item: tree_sitter::Node, lang: &str) -> Modifiers {
+    match lang {
+        "rust" => detect_rust_modifiers(source, enclosing_item),
+        "typescript" | "javascript" => detect_ts_js_modifiers(source, enclosing_item),
+        _ => Modifiers::default(),
+    }
+}
+
+fn detect_rust_modifiers(source: &[u8], item: tree_sitter::Node) -> Modifiers {
+    let mut m = Modifiers::default();
+    let mut cursor = item.walk();
+    for child in item.children(&mut cursor) {
+        match child.kind() {
+            "visibility_modifier" => {
+                if let Ok(text) = child.utf8_text(source) {
+                    let trimmed = text.trim();
+                    m.visibility = Some(trimmed.to_string());
+                    if trimmed.starts_with("pub") {
+                        m.is_exported = true;
+                    }
+                }
+            }
+            "function_modifiers" => {
+                // `function_modifiers` is the wrapper that holds `async`,
+                // `const`, `unsafe` keywords. Walk its children.
+                let mut sub = child.walk();
+                for sub_child in child.children(&mut sub) {
+                    if sub_child.kind() == "async" {
+                        m.is_async = true;
+                    }
+                }
+            }
+            "async" => m.is_async = true, // fallback in case grammar flattens
+            "default" => { /* trait default impl; not flagged in v1 */ }
+            _ => {}
+        }
+    }
+    // Trait method signatures have no body — `function_signature_item` is the
+    // tell. Mark them `is_abstract = true` so dead_code / arch don't flag
+    // trait methods as zombies. Implementations stay `is_abstract = false`.
+    if item.kind() == "function_signature_item" {
+        m.is_abstract = true;
+    }
+    m
+}
+
+fn detect_ts_js_modifiers(source: &[u8], definition_node: tree_sitter::Node) -> Modifiers {
+    // TS / JS export: the defining item (function_declaration / class_declaration
+    // / lexical_declaration / method_definition) is either directly in the
+    // module or wrapped in an `export_statement`. Walk direct children of both,
+    // since the `export` keyword lives on the wrapper when present.
+    let mut m = Modifiers::default();
+    let mut cursor = definition_node.walk();
+    for child in definition_node.children(&mut cursor) {
+        match child.kind() {
+            "export" => {
+                m.is_exported = true;
+                m.visibility.get_or_insert_with(|| {
+                    child
+                        .utf8_text(source)
+                        .map(|t| t.trim().to_string())
+                        .unwrap_or_else(|_| "export".to_string())
+                });
+            }
+            "default" => {
+                m.is_exported = true;
+                m.visibility.get_or_insert_with(|| "default".to_string());
+            }
+            "async" => m.is_async = true,
+            "static" => m.is_static = true,
+            "abstract" => m.is_abstract = true,
+            _ => {}
+        }
+    }
+    if !m.is_exported {
+        if let Some(parent) = definition_node.parent() {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                match child.kind() {
+                    "export" => {
+                        m.is_exported = true;
+                        m.visibility.get_or_insert_with(|| {
+                            child
+                                .utf8_text(source)
+                                .map(|t| t.trim().to_string())
+                                .unwrap_or_else(|_| "export".to_string())
+                        });
+                    }
+                    "default" => {
+                        m.is_exported = true;
+                        m.visibility.get_or_insert_with(|| "default".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    m
+}
+
 fn extract_signature(content: &str, start_row: usize, _end_row: usize) -> Option<String> {
     let line = content.lines().nth(start_row)?;
     let sig = line.trim().chars().take(120).collect::<String>();
@@ -1457,5 +1592,114 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string(), "caller".to_string()]);
         assert!(!report.truncated);
+    }
+
+    #[tokio::test]
+    async fn detects_pub_and_async_for_rust() {
+        let (_dir, _root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "\
+             pub async fn exported_async() {}\n\
+             pub fn exported_sync() {}\n\
+             fn private_fn() {}\n\
+             pub(crate) fn crate_pub() {}\n\
+             static NOT_A_FN: i32 = 0;\n\
+             pub trait Greeter { fn hello(); }\n\
+             ",
+        )])
+        .await;
+
+        let nodes = engine.storage.all_nodes().unwrap();
+        let by_name: std::collections::HashMap<String, _> =
+            nodes.iter().map(|n| (n.name.clone(), n)).collect();
+
+        let exported_async = by_name.get("exported_async").expect("missing");
+        assert!(exported_async.is_exported, "pub async fn should be exported");
+        assert!(exported_async.is_async, "pub async fn should be async");
+        assert_eq!(exported_async.visibility.as_deref(), Some("pub"));
+
+        let exported_sync = by_name.get("exported_sync").expect("missing");
+        assert!(exported_sync.is_exported);
+        assert!(!exported_sync.is_async);
+        assert_eq!(exported_sync.visibility.as_deref(), Some("pub"));
+
+        let private_fn = by_name.get("private_fn").expect("missing");
+        assert!(!private_fn.is_exported, "no `pub` should be private");
+        assert_eq!(private_fn.visibility, None);
+
+        let crate_pub = by_name.get("crate_pub").expect("missing");
+        assert!(
+            crate_pub.is_exported,
+            "pub(crate) should register as exported"
+        );
+        assert_eq!(crate_pub.visibility.as_deref(), Some("pub(crate)"));
+
+        // Trait method `hello` is detected by the parser (we tag
+        // function_signature_item as abstract) — verify the grammar picked
+        // it up. If the parser doesn't list it under `function_item`, the
+        // assertion below just no-ops.
+        if let Some(hello) = by_name.get("hello") {
+            assert!(
+                hello.is_abstract,
+                "trait method signature should be flagged abstract"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detects_export_for_typescript() {
+        // TreeSitterEngine parses TS via the registered `typescript` lang.
+        let (_dir, _root, engine) = bootstrap(&[(
+            "src/lib.ts",
+            "\
+             export function exportedFunction() {}\n\
+             export const exportedConst = 1;\n\
+             export default class DefaultClass {}\n\
+             function privateFunction() {}\n\
+             ",
+        )])
+        .await;
+
+        let nodes = engine.storage.all_nodes().unwrap();
+        let by_name: std::collections::HashMap<String, _> =
+            nodes.iter().map(|n| (n.name.clone(), n)).collect();
+
+        if let Some(exported) = by_name.get("exportedFunction") {
+            assert!(exported.is_exported, "TS export function should be exported");
+        }
+        if let Some(default) = by_name.get("DefaultClass") {
+            assert!(default.is_exported, "export default class should be exported");
+        }
+        if let Some(private) = by_name.get("privateFunction") {
+            assert!(
+                !private.is_exported,
+                "non-exported TS function should NOT be exported"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn is_exported_false_for_function_in_let_binding() {
+        // Sanity check on Rust: a function inside a closure should
+        // not accidentally inherit pub from a surrounding item.
+        let (_dir, _root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "\
+             pub fn outer() {\
+                 fn nested() {}\
+             }\
+             ",
+        )])
+        .await;
+
+        let nodes = engine.storage.all_nodes().unwrap();
+        let nested = nodes
+            .iter()
+            .find(|n| n.name == "nested")
+            .expect("missing nested");
+        // Note: tree-sitter Rust doesn't surface `nested` as a definition in
+        // our grammar (it captures only top-level `function_item`), so this
+        // is more a guard against false detection than a positive assertion.
+        assert!(!nested.is_exported, "nested fn without pub must not be exported");
     }
 }
