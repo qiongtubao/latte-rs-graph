@@ -885,3 +885,57 @@ pub enum CypherScalar {
     Bool(bool),
     Null,
 }
+
+// =============================================================================
+// Algorithmic semantic similarity
+// =============================================================================
+
+/// Deterministic semantic features computed for a callable declaration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticSignature {
+    pub name: String,
+    pub tokens: Vec<String>,
+    pub ast_profile: Vec<f32>,
+    pub minhash: Vec<u32>,
+    pub data_flow_set: Vec<String>,
+    pub api_sig: Vec<String>,
+    pub ri_vec: Vec<f32>,
+    pub embedding: Vec<f32>,
+    pub module_path: Option<String>,
+    pub is_exported: bool,
+    pub is_async: bool,
+}
+
+/// Weights and edge-emission limits for algorithmic semantic similarity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticConfig {
+    pub weight_tfidf: f32,
+    pub weight_ri: f32,
+    pub weight_api: f32,
+    pub weight_ast: f32,
+    pub weight_data_flow: f32,
+    pub weight_module_prox: f32,
+    pub weight_minhash: f32,
+    pub weight_struct_boost: f32,
+    pub threshold: f32,
+    pub max_per_node: usize,
+    pub dim: usize,
+}
+
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        Self {
+            weight_tfidf: 0.30,
+            weight_ri: 0.30,
+            weight_api: 0.10,
+            weight_ast: 0.10,
+            weight_data_flow: 0.05,
+            weight_module_prox: 0.05,
+            weight_minhash: 0.05,
+            weight_struct_boost: 0.05,
+            threshold: 0.75,
+            max_per_node: 10,
+            dim: 768,
+        }
+    }
+}

@@ -9,7 +9,7 @@ use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 use crate::storage::SqliteStorage;
 use crate::traits::GraphProvider;
 use crate::types::*;
-use crate::engine::metrics::compute_metrics;
+use crate::engine::{metrics::compute_metrics, semantic};
 
 // =============================================================================
 // Language Registration
@@ -256,7 +256,7 @@ impl TreeSitterEngine {
                             &name,
                             lang.name,
                         );
-                        let extra = crate::engine::metrics::metrics_to_extra(&metrics);
+                        let mut extra = crate::engine::metrics::metrics_to_extra(&metrics);
 
                         // Detect modifiers from the surrounding item so is_exported /
                         // is_async / etc. reflect what the parser actually sees. Previously
@@ -264,6 +264,18 @@ impl TreeSitterEngine {
                         // entry-point heuristic and Phase 4's entry_points_count
                         // always zero.
                         let mods = detect_modifiers(content.as_bytes(), metrics_root, lang.name);
+                        let mut semantic_signature = semantic::embed_function(
+                            content.as_bytes(),
+                            metrics_root,
+                            &name,
+                            lang.name,
+                        );
+                        semantic_signature.module_path = Some(relative.clone());
+                        semantic_signature.is_exported = mods.is_exported;
+                        semantic_signature.is_async = mods.is_async;
+                        for (key, value) in semantic::signature_to_extra(&semantic_signature) {
+                            extra.insert(key, value);
+                        }
                         let node = Node {
                             id: node_id.clone(),
                             kind: def_kind,
@@ -478,6 +490,126 @@ impl TreeSitterEngine {
         }
 
         Ok(())
+    }
+
+    /// Emit the highest-scoring semantic neighbors for each indexed callable.
+    fn emit_semantic_edges(&self) -> GraphResult<usize> {
+        let config = SemanticConfig::default();
+        let mut signatures = self
+            .storage
+            .all_nodes()?
+            .into_iter()
+            .filter_map(|node| {
+                let is_callable = matches!(
+                    &node.kind,
+                    NodeKind::Function
+                        | NodeKind::Method
+                        | NodeKind::Class
+                        | NodeKind::Struct
+                        | NodeKind::Trait
+                );
+                if !is_callable {
+                    return None;
+                }
+                let mut signature = semantic::signature_from_extra(&node.extra)?;
+                signature.name = node.name.clone();
+                signature.module_path = Some(node.file_path.clone());
+                signature.is_exported = node.is_exported;
+                signature.is_async = node.is_async;
+                Some((node, signature))
+            })
+            .collect::<Vec<_>>();
+
+        if signatures.len() < 2 {
+            return Ok(0);
+        }
+
+        // Rebuild RI over the complete callable corpus so IDF reflects token
+        // rarity across the project rather than collapsing to one per file.
+        let corpus = semantic::ri::build_ri_corpus(
+            signatures
+                .iter()
+                .map(|(_, signature)| signature.tokens.as_slice()),
+            5,
+            config.dim,
+        );
+        for (_, signature) in &mut signatures {
+            signature.ri_vec = semantic::corpus_ri_vec(&signature.tokens, &corpus, config.dim);
+        }
+
+        // Fold one CALLS-neighborhood propagation step into the corpus RI
+        // channel used by the combiner, then persist the post-processed vector.
+        let node_indexes = signatures
+            .iter()
+            .enumerate()
+            .map(|(index, (node, _))| (node.id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let call_edges = self
+            .storage
+            .all_edges()?
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls)
+            .collect::<Vec<_>>();
+        let base_embeddings = signatures
+            .iter()
+            .map(|(_, signature)| signature.ri_vec.clone())
+            .collect::<Vec<_>>();
+        for (index, (node, signature)) in signatures.iter_mut().enumerate() {
+            let neighbors = call_edges
+                .iter()
+                .filter(|edge| edge.source == node.id)
+                .filter_map(|edge| node_indexes.get(edge.target.as_str()).copied())
+                .filter(|neighbor| *neighbor != index)
+                .take(5)
+                .map(|neighbor| base_embeddings[neighbor].clone())
+                .collect::<Vec<_>>();
+            if !neighbors.is_empty() {
+                semantic::diffusion::diffuse(&mut signature.ri_vec, &neighbors, 0.3);
+            }
+            signature.embedding = signature.ri_vec.clone();
+            for (key, value) in semantic::signature_to_extra(signature) {
+                node.extra.insert(key, value);
+            }
+            self.storage.upsert_node(node)?;
+        }
+
+        let mut inserted = 0;
+        for source_index in 0..signatures.len() {
+            let mut candidates = (0..signatures.len())
+                .filter(|target_index| *target_index != source_index)
+                .filter_map(|target_index| {
+                    let score = semantic::combined_score(
+                        &signatures[source_index].1,
+                        &signatures[target_index].1,
+                        &config,
+                    );
+                    (score >= config.threshold).then_some((target_index, score))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|(left_index, left_score), (right_index, right_score)| {
+                right_score
+                    .total_cmp(left_score)
+                    .then_with(|| signatures[*left_index].0.id.cmp(&signatures[*right_index].0.id))
+            });
+
+            for (target_index, score) in candidates.into_iter().take(config.max_per_node) {
+                let source = &signatures[source_index].0;
+                let target = &signatures[target_index].0;
+                self.storage.upsert_edge(&Edge {
+                    id: format!("semantic:{}:{}", source.id, target.id),
+                    source: source.id.clone(),
+                    target: target.id.clone(),
+                    kind: EdgeKind::Other("semantically_related".to_string()),
+                    line: source.start_line,
+                    col: source.start_column,
+                    metadata: Some(format!(r#"{{"score":{score:.6}}}"#)),
+                    provenance: Some("semantic:algorithmic".to_string()),
+                })?;
+                inserted += 1;
+            }
+        }
+
+        Ok(inserted)
     }
 
     /// Re-index a subset of files in place, without touching the rest of
@@ -711,6 +843,11 @@ impl GraphProvider for TreeSitterEngine {
 
         if let Err(e) = self.resolve_references() {
             stats.errors.push(format!("Reference resolution: {}", e));
+        }
+
+        match self.emit_semantic_edges() {
+            Ok(created) => stats.edges_created += created,
+            Err(error) => stats.errors.push(format!("semantic edges: {error}")),
         }
 
         stats.duration_ms = start.elapsed().as_millis() as u64;
