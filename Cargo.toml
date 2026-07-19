@@ -49,3 +49,7 @@ name = "latte_rs_graph"
 [[bin]]
 name = "lrg"
 path = "src/bin/main.rs"
+
+[[bin]]
+name = "latte-mcp"
+path = "src/bin/mcp_server.rs"
