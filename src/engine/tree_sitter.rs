@@ -876,6 +876,57 @@ impl GraphProvider for TreeSitterEngine {
         let node = self.storage.node_by_id(node_id)?;
         Ok(node.and_then(|n| crate::engine::metrics::metrics_from_extra(&n.extra)))
     }
+
+    async fn dead_code(&self) -> GraphResult<DeadCodeReport> {
+        let entries = self.storage.dead_code()?;
+        let entry_points = self.storage.entry_point_count().unwrap_or(0);
+        let dead_count = entries.len();
+        // `total_functions` counts every callable (`function`/`method`/`test`)
+        // node so the CLI can show "N dead (out of M total, K entry points)".
+        let total_functions = match self.storage.stats() {
+            Ok(s) => s
+                .node_kinds
+                .iter()
+                .filter(|k| {
+                    matches!(
+                        k.kind.as_str(),
+                        "function" | "method" | "test"
+                    )
+                })
+                .map(|k| k.count)
+                .sum::<usize>(),
+            Err(_) => dead_count + entry_points,
+        };
+        Ok(DeadCodeReport {
+            total_functions,
+            entry_points,
+            dead_count,
+            entries,
+        })
+    }
+
+    async fn blast_radius(
+        &self,
+        changed_paths: Vec<String>,
+        depth: u32,
+        direction: BlastDirection,
+        base_ref: Option<String>,
+    ) -> GraphResult<BlastRadiusReport> {
+        let seeds = self.storage.nodes_for_files(&changed_paths)?;
+        let seed_node_ids: Vec<String> = seeds
+            .iter()
+            .flat_map(|s| s.nodes.iter().map(|n| n.id.clone()))
+            .collect();
+        let impact = self
+            .storage
+            .reachable_calls(&seed_node_ids, depth, direction)?;
+        Ok(BlastRadiusReport {
+            base_ref,
+            changed_files: changed_paths,
+            seeds,
+            impact,
+        })
+    }
 }
 
 // =============================================================================
@@ -1180,5 +1231,98 @@ mod tests {
         assert_eq!(report.changed_files, 1);
         assert_eq!(report.nodes_added, 0);
         assert_eq!(report.nodes_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_dead_code_finds_unused_function() {
+        // Two unused + one used + a `main` entry. `caller` is `pub fn` but
+        // the parser does not currently propagate `pub` into either
+        // `is_exported` or `visibility`, so we can't rely on it as an
+        // entry-point marker here. `fn main()` is detected via the
+        // name-in-{'main','index','__init__'} rule.
+        let (_dir, _root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "fn used() {}\n\
+             fn unused() {}\n\
+             fn also_unused() {}\n\
+             pub fn caller() { used(); }\n\
+             fn main() { caller(); }\n",
+        )])
+        .await;
+
+        let report = engine.dead_code().await.unwrap();
+        let dead_ids: std::collections::BTreeSet<String> =
+            report.entries.iter().map(|e| e.node.name.clone()).collect();
+        // `unused` and `also_unused` are unreferenced — must be flagged.
+        assert!(
+            dead_ids.contains("unused"),
+            "expected `unused` in dead set, got {:?}",
+            dead_ids
+        );
+        assert!(
+            dead_ids.contains("also_unused"),
+            "expected `also_unused` in dead set, got {:?}",
+            dead_ids
+        );
+        // `used` is called by `caller` → reached → must not be dead.
+        assert!(
+            !dead_ids.contains("used"),
+            "`used` is called by caller() → must not be dead, got {:?}",
+            dead_ids
+        );
+        // `main` is the entry point (name match) → must not be dead.
+        assert!(
+            !dead_ids.contains("main"),
+            "`main` is entry point, must not be dead, got {:?}",
+            dead_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_blast_radius_inbound() {
+        // lib.rs exposes api() and helper(). consumer.rs calls both.
+        // Requesting blast_radius on lib.rs should pick up `caller`
+        // from consumer.rs as the sole inbound impact.
+        let (_dir, _root, engine) = bootstrap(&[
+            (
+                "src/lib.rs",
+                "pub fn api() {}\npub fn helper() {}\n",
+            ),
+            (
+                "src/consumer.rs",
+                "use super::*;\npub fn caller() { api(); helper(); }\n",
+            ),
+        ])
+        .await;
+
+        let report = engine
+            .blast_radius(
+                vec!["src/lib.rs".into()],
+                3,
+                BlastDirection::Inbound,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let names: std::collections::BTreeSet<String> = report
+            .impact
+            .nodes
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            names.contains("caller"),
+            "expected caller() to be in inbound blast, got {:?}",
+            names
+        );
+        // Changed files should match what we passed.
+        assert_eq!(report.changed_files, vec!["src/lib.rs".to_string()]);
+        // consumer.rs is the only impacted file.
+        assert_eq!(report.impact.files, vec!["src/consumer.rs".to_string()]);
+        // Seeds: lib.rs owned api + helper.
+        assert_eq!(report.seeds.len(), 1);
+        assert_eq!(report.seeds[0].file_path, "src/lib.rs");
+        assert_eq!(report.seeds[0].nodes.len(), 2);
     }
 }

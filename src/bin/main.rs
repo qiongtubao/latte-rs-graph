@@ -96,7 +96,25 @@ enum Command {
         /// Symbol name (function/class) to look up
         name: String,
     },
- }
+    /// Show function/method nodes with zero callers, excluding entry points.
+    Dead {
+        /// Path to the graph database
+        db: PathBuf,
+    },
+    /// Map git changes to their blast radius (transitive callers).
+    Blast {
+        /// Path to the graph database
+        db: PathBuf,
+        /// Optional git ref (e.g. "HEAD~1"). If empty, falls back to `git status`.
+        base: Option<String>,
+        /// Max traversal depth from changed symbols (default 3)
+        #[arg(short = 'l', long, default_value = "3")]
+        depth: u32,
+        /// Direction: inbound | outbound | both
+        #[arg(short = 'D', long, default_value = "inbound")]
+        direction: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> GraphResult<()> {
@@ -319,7 +337,182 @@ async fn main() -> GraphResult<()> {
                 println!();
             }
         }
+
+        Command::Dead { db } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+            let report = engine.dead_code().await?;
+            let live = report.total_functions.saturating_sub(report.dead_count)
+                .saturating_sub(report.entry_points);
+            println!(
+                "💀 {} dead functions ({} total functions, {} entry points, {} live)",
+                report.dead_count, report.total_functions, report.entry_points, live
+            );
+            if report.entries.is_empty() {
+                println!("   ✓ no unreachable symbols");
+            } else {
+                for e in &report.entries {
+                    println!(
+                        "   {}:{}  {} {}",
+                        e.node.file_path,
+                        e.node.start_line,
+                        e.node.kind.as_str(),
+                        e.node.qualified_name,
+                    );
+                }
+            }
+        }
+
+        Command::Blast { db, base, depth, direction } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+
+            // Resolve changed paths via git. The trait/engine never shells
+            // out — that's the CLI's job. Engine stays pure for testing.
+            // Derive project root from the db location: db lives at
+            // `<root>/.latte/graph.db`, so the project root is two levels up.
+            let project_root = db
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let changed_paths = match resolve_git_changes(base.as_deref(), &project_root) {
+                Ok(v) => v,
+                Err(msg) => {
+                    println!("⚠ {msg}");
+                    return Ok(());
+                }
+            };
+            if changed_paths.is_empty() {
+                println!("⚠ no changed files detected (working tree clean or repo not initialised).");
+                return Ok(());
+            }
+
+            let dir = parse_direction(&direction);
+            let report = engine
+                .blast_radius(changed_paths.clone(), depth, dir, base.clone())
+                .await?;
+
+            let dir_label = match dir {
+                latte_rs_graph::types::BlastDirection::Inbound => "inbound",
+                latte_rs_graph::types::BlastDirection::Outbound => "outbound",
+                latte_rs_graph::types::BlastDirection::Both => "both",
+            };
+            println!("💥 Blast radius ({dir_label}, depth={depth})");
+            println!("   Changed:        {} files", report.changed_files.len());
+            let seed_count: usize = report.seeds.iter().map(|s| s.nodes.len()).sum();
+            println!("   Seeds:          {} symbols", seed_count);
+            println!(
+                "   Impacted:       {} symbols across {} files",
+                report.impact.total_count,
+                report.impact.files.len()
+            );
+            if !report.impact.files.is_empty() {
+                println!("   files:");
+                for f in &report.impact.files {
+                    println!("     - {f}");
+                }
+            }
+            // Top symbols — first 20 deterministic (already sorted by engine).
+            let head = report.impact.nodes.iter().take(20);
+            println!("   top symbols:");
+            for n in head {
+                println!(
+                    "     - {} {}  {}:{}",
+                    n.kind.as_str(),
+                    n.qualified_name,
+                    n.file_path,
+                    n.start_line,
+                );
+            }
+        }
      }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CLI helpers — kept out of the trait so the engine stays pure / testable
+// and the CLI shells out only at the user-interface boundary.
+// ---------------------------------------------------------------------------
+
+/// Run `git` from the current directory. If `--base` is given, returns
+/// the output of `git diff --name-only <base>`; otherwise the union of
+/// `git ls-files --modified --others --exclude-standard` (covers staged,
+/// unstaged, and untracked). On non-zero exit / missing binary we return
+/// a user-facing error string the caller can print and exit on.
+fn resolve_git_changes(
+    base: Option<&str>,
+    project_root: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    use std::process::Command;
+    let git = |args: &[&str]| -> std::io::Result<std::process::Output> {
+        Command::new("git").args(args).current_dir(project_root).output()
+    };
+
+    let raw = if let Some(b) = base {
+        let out = git(&["diff", "--name-only", b])
+            .map_err(|e| format!("failed to invoke git: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "`git diff --name-only {b}` exited with status {}: {stderr}",
+                out.status
+            ));
+        }
+        out.stdout
+    } else {
+        // Status porcelain: lines look like ` M src/foo.rs`, `?? src/bar.rs`.
+        // Column 2 (1-indexed) holds the path.
+        let out = git(&["status", "--porcelain"])
+            .map_err(|e| format!("failed to invoke git: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "`git status --porcelain` exited with status {}: {stderr}",
+                out.status
+            ));
+        }
+        out.stdout
+    };
+
+    let text = String::from_utf8_lossy(&raw);
+    let mut paths: Vec<String> = Vec::new();
+    // Parse each output line into a path. Two formats:
+    // same offset rule: drop the 3-char status prefix ("XY ") on
+    // porcelain, drop nothing on plain name-only. Don't `trim()`
+    // inside the porcelain branch — the column-2 separator IS
+    // significant and gets eaten by trim, shifting our offset.
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let body = if base.is_some() {
+            line.trim()
+        } else if line.len() >= 3 {
+            &line[3..]
+        } else {
+            ""
+        };
+        let final_path = if let Some(idx) = body.find(" -> ") {
+            body[idx + 4..].trim()
+        } else {
+            body.trim()
+        };
+        if !final_path.is_empty() {
+            paths.push(final_path.to_string());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Map the user-facing direction string to a typed enum.
+fn parse_direction(s: &str) -> latte_rs_graph::types::BlastDirection {
+    match s.to_ascii_lowercase().as_str() {
+        "outbound" => latte_rs_graph::types::BlastDirection::Outbound,
+        "both" => latte_rs_graph::types::BlastDirection::Both,
+        _ => latte_rs_graph::types::BlastDirection::Inbound,
+    }
 }

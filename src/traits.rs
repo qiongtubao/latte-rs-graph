@@ -3,8 +3,9 @@ use std::path::Path;
 
 use crate::error::GraphResult;
 use crate::types::{
-    BuildOptions, BuildReport, ComplexityMetrics, GraphData, GraphStats, Node, RelationResult,
-    SearchCodeRequest, SearchCodeResponse, SearchOptions, UpdateReport,
+    BlastDirection, BlastRadiusReport, BuildOptions, BuildReport, ComplexityMetrics, DeadCodeReport,
+    GraphData, GraphStats, Node, RelationResult, SearchCodeRequest, SearchCodeResponse,
+    SearchOptions, UpdateReport,
 };
 
 /// Core trait that every graph engine must implement.
@@ -64,8 +65,24 @@ pub trait GraphProvider: Send + Sync {
 
     /// Look up the complexity metrics previously stored on a function node
     /// (cyclomatic, cognitive, max loop depth, alloc/linear-scan-in-loop,
-    /// recursion). Returns `None` if the node has no metrics or doesn't exist.
     async fn complexity(&self, node_id: &str) -> GraphResult<Option<ComplexityMetrics>>;
+
+    /// Return all `function`/`method`/`test` nodes with no `calls` inbound
+    /// edge and no entry-point status. Sorted by `file_path` then `name`.
+    async fn dead_code(&self) -> GraphResult<DeadCodeReport>;
+
+    /// Given a list of changed file paths (relative to project root),
+    /// return the symbols defined in them and their transitive `calls`
+    /// reachability set. `direction` defaults to `Inbound` (callers).
+    /// `base_ref` is just propagated into the report — the engine does not
+    /// resolve git refs itself.
+    async fn blast_radius(
+        &self,
+        changed_paths: Vec<String>,
+        depth: u32,
+        direction: BlastDirection,
+        base_ref: Option<String>,
+    ) -> GraphResult<BlastRadiusReport>;
 
 
     // =====================================================================

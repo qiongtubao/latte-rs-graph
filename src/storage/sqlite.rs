@@ -794,6 +794,333 @@ impl SqliteStorage {
         Ok(count as u32)
     }
 
+    // =========================================================================
+    // Dead-code + Blast-radius analysis (Phase 2)
+    // =========================================================================
+
+    /// All `function`/`method`/`test` nodes that:
+    ///   1. are not the `target` of any `calls` edge (i.e. nobody calls them), AND
+    ///   2. are NOT entry points.
+    ///
+    /// Entry-point heuristic: name in `main`/`index`/`__init__`, file under
+    /// `/bin/`, file matching `main.<ext>` or `index.<ext>`, `is_exported=1`,
+    /// or `visibility` in `public`/`pub`.
+    ///
+    /// `reasons_excluded_from_entry` on each returned entry is empty — the node
+    /// survived because it has zero callers; the SQL already filtered out the
+    /// entry-point candidates. Callers that want a per-row reason should run the
+    /// inverse query themselves.
+    pub fn dead_code(&self) -> GraphResult<Vec<DeadCodeEntry>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, name, qualified_name, file_path, language,
+                    start_line, end_line, start_column, end_column,
+                    signature, docstring, visibility,
+                    is_exported, is_async, is_static, is_abstract, extra
+             FROM nodes
+             WHERE valid = 1
+               AND kind IN ('function','method','test')
+               AND id NOT IN (SELECT target FROM edges WHERE kind='calls' AND valid=1)
+               AND NOT (
+                   name IN ('main','index','__init__')
+                   OR file_path LIKE '%/bin/%'
+                   OR file_path LIKE '%/main.%'
+                   OR file_path LIKE '%/index.%'
+                   OR is_exported = 1
+                   OR COALESCE(visibility, '') IN ('public','pub')
+               )
+             ORDER BY file_path, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let extra_str: String = row.get(17)?;
+            let extra: HashMap<String, String> =
+                serde_json::from_str(&extra_str).unwrap_or_default();
+            Ok(Node {
+                id: row.get(0)?,
+                kind: NodeKind::from_str(&row.get::<_, String>(1)?),
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                file_path: row.get(4)?,
+                language: row.get(5)?,
+                start_line: row.get::<_, i32>(6)? as u32,
+                end_line: row.get::<_, i32>(7)? as u32,
+                start_column: row.get::<_, i32>(8)? as u32,
+                end_column: row.get::<_, i32>(9)? as u32,
+                signature: row.get(10)?,
+                docstring: row.get(11)?,
+                visibility: row.get(12)?,
+                is_exported: row.get::<_, i32>(13)? != 0,
+                is_async: row.get::<_, i32>(14)? != 0,
+                is_static: row.get::<_, i32>(15)? != 0,
+                is_abstract: row.get::<_, i32>(16)? != 0,
+                extra,
+            })
+        })?;
+        let nodes: Vec<Node> = rows.collect::<Result<_, _>>()?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| DeadCodeEntry { node: n, reasons_excluded_from_entry: Vec::new() })
+            .collect())
+    }
+
+    /// For each file in `paths`, return all definition-kind nodes (function/
+    /// method/class/struct/trait/interface/route/constructor) that live in it.
+    /// Files with zero matching nodes are skipped from the output. `paths`
+    /// over 500 entries are chunked so we stay under SQLite's parameter cap.
+    pub fn nodes_for_files(&self, paths: &[String]) -> GraphResult<Vec<BlastSeed>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        const CHUNK: usize = 500;
+
+        let mut collected: Vec<Node> = Vec::new();
+        for chunk in paths.chunks(CHUNK) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, name, qualified_name, file_path, language,
+                        start_line, end_line, start_column, end_column,
+                        signature, docstring, visibility,
+                        is_exported, is_async, is_static, is_abstract, extra
+                 FROM nodes
+                 WHERE valid = 1
+                   AND file_path IN ({placeholders})
+                   AND kind IN ('function','method','class','struct','trait',
+                                'interface','route','constructor')"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params_vec.as_slice(), |row| {
+                let extra_str: String = row.get(17)?;
+                let extra: HashMap<String, String> =
+                    serde_json::from_str(&extra_str).unwrap_or_default();
+                Ok(Node {
+                    id: row.get(0)?,
+                    kind: NodeKind::from_str(&row.get::<_, String>(1)?),
+                    name: row.get(2)?,
+                    qualified_name: row.get(3)?,
+                    file_path: row.get(4)?,
+                    language: row.get(5)?,
+                    start_line: row.get::<_, i32>(6)? as u32,
+                    end_line: row.get::<_, i32>(7)? as u32,
+                    start_column: row.get::<_, i32>(8)? as u32,
+                    end_column: row.get::<_, i32>(9)? as u32,
+                    signature: row.get(10)?,
+                    docstring: row.get(11)?,
+                    visibility: row.get(12)?,
+                    is_exported: row.get::<_, i32>(13)? != 0,
+                    is_async: row.get::<_, i32>(14)? != 0,
+                    is_static: row.get::<_, i32>(15)? != 0,
+                    is_abstract: row.get::<_, i32>(16)? != 0,
+                    extra,
+                })
+            })?;
+            for r in rows {
+                collected.push(r?);
+            }
+        }
+
+        // Group by file_path, preserving the input order of the requested paths
+        // so the CLI output is stable.
+        let mut by_file: std::collections::BTreeMap<String, Vec<Node>> =
+            std::collections::BTreeMap::new();
+        for n in collected {
+            by_file.entry(n.file_path.clone()).or_default().push(n);
+        }
+        let mut seeds: Vec<BlastSeed> = Vec::with_capacity(by_file.len());
+        for path in paths {
+            if let Some(nodes) = by_file.remove(path) {
+                seeds.push(BlastSeed { file_path: path.clone(), nodes });
+            }
+        }
+        Ok(seeds)
+    }
+
+    /// Recursive CTE-based reachability on `calls` edges from `seeds`,
+    /// bounded by `depth` BFS hops. Excludes the seeds themselves.
+    /// Direction:
+    ///   * `Inbound`  — who calls the seeds (default)
+    ///   * `Outbound` — who the seeds call
+    ///   * `Both`     — union of the two
+    ///
+    /// `depth=0` returns an empty impact. Empty `seeds` also returns empty.
+    pub fn reachable_calls(
+        &self,
+        seeds: &[String],
+        depth: u32,
+        direction: BlastDirection,
+    ) -> GraphResult<BlastImpact> {
+        if seeds.is_empty() || depth == 0 {
+            return Ok(BlastImpact {
+                nodes: Vec::new(),
+                files: Vec::new(),
+                total_count: 0,
+            });
+        }
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        const CHUNK: usize = 500;
+
+        // Build a direction config once.
+        let variants: &[(char, char)] = match direction {
+            BlastDirection::Inbound => &[('s', 't')],     // target IN (seeds), seed=source
+            BlastDirection::Outbound => &[('t', 's')],    // source IN (seeds), seed=target
+            BlastDirection::Both => &[('s', 't'), ('t', 's')],
+        };
+
+        // (a) Discover the impacted node ids via CTE, deduped across chunks.
+        let mut impact_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for &(seed_role, neighbor_role) in variants {
+            // seed_role is the role of node_ids in the edges table — the side
+            // we already know (== one of the seeds); neighbor_role is the side
+            // we hop to.
+            let (seed_col, next_col) = match (seed_role, neighbor_role) {
+                ('s', 't') => ("target", "source"), // inbound: starting from call targets
+                ('t', 's') => ("source", "target"), // outbound: starting from call sources
+                _ => unreachable!("variant guard"),
+            };
+            for chunk in seeds.chunks(CHUNK) {
+                let ph = std::iter::repeat("?")
+                    .take(chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                // For the seed set itself we filter neighbor_role IN-chunk in
+                // the base case, and add a separate `id NOT IN (seeds)` filter
+                // at the end so we never emit a seed as its own impacted node.
+                let base_filter = format!("{seed_col} IN ({ph})");
+                let cte = format!(
+                    "WITH RECURSIVE reach(node_id, depth) AS (\n\
+                       SELECT e.{next_col}, 1 FROM edges e\n\
+                       WHERE e.{base_filter}\n\
+                         AND e.kind = 'calls' AND e.valid = 1\n\
+                     UNION\n\
+                       SELECT e.{next_col}, r.depth + 1 FROM reach r\n\
+                       JOIN edges e ON e.{seed_col} = r.node_id\n\
+                       WHERE e.kind = 'calls' AND e.valid = 1\n\
+                         AND r.depth < ?\n
+                     )\n\
+                     SELECT DISTINCT node_id FROM reach",
+                );
+                let mut stmt = conn.prepare(&cte)?;
+                // Pack the seeds (already &str under `chunk`) plus the depth
+                // into a single slice of `&dyn ToSql` — that's what
+                // rusqlite's `Params` impl accepts.
+                let depth_param: i64 = depth as i64;
+                let params_vec: Vec<&dyn rusqlite::ToSql> = {
+                    let mut v: Vec<&dyn rusqlite::ToSql> =
+                        Vec::with_capacity(chunk.len() + 1);
+                    for s in chunk {
+                        v.push(s);
+                    }
+                    v.push(&depth_param);
+                    v
+                };
+                let id_rows = stmt.query_map(params_vec.as_slice(), |row| {
+                    let id: String = row.get(0)?;
+                    Ok(id)
+                })?;
+                for r in id_rows {
+                    impact_ids.insert(r?);
+                }
+            }
+        }
+        // Drop the seeds themselves from the impacted set.
+        let seed_set: std::collections::HashSet<&str> =
+            seeds.iter().map(|s| s.as_str()).collect();
+        impact_ids.retain(|id| !seed_set.contains(id.as_str()));
+        if impact_ids.is_empty() {
+            return Ok(BlastImpact {
+                nodes: Vec::new(),
+                files: Vec::new(),
+                total_count: 0,
+            });
+        }
+
+        // (b) Fetch the node rows for the impacted ids, chunked.
+        let ids: Vec<String> = impact_ids.into_iter().collect();
+        let mut nodes: Vec<Node> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let ph = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, name, qualified_name, file_path, language,
+                        start_line, end_line, start_column, end_column,
+                        signature, docstring, visibility,
+                        is_exported, is_async, is_static, is_abstract, extra
+                 FROM nodes
+                 WHERE valid = 1 AND id IN ({ph})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params_vec.as_slice(), |row| {
+                let extra_str: String = row.get(17)?;
+                let extra: HashMap<String, String> =
+                    serde_json::from_str(&extra_str).unwrap_or_default();
+                Ok(Node {
+                    id: row.get(0)?,
+                    kind: NodeKind::from_str(&row.get::<_, String>(1)?),
+                    name: row.get(2)?,
+                    qualified_name: row.get(3)?,
+                    file_path: row.get(4)?,
+                    language: row.get(5)?,
+                    start_line: row.get::<_, i32>(6)? as u32,
+                    end_line: row.get::<_, i32>(7)? as u32,
+                    start_column: row.get::<_, i32>(8)? as u32,
+                    end_column: row.get::<_, i32>(9)? as u32,
+                    signature: row.get(10)?,
+                    docstring: row.get(11)?,
+                    visibility: row.get(12)?,
+                    is_exported: row.get::<_, i32>(13)? != 0,
+                    is_async: row.get::<_, i32>(14)? != 0,
+                    is_static: row.get::<_, i32>(15)? != 0,
+                    is_abstract: row.get::<_, i32>(16)? != 0,
+                    extra,
+                })
+            })?;
+            for r in rows {
+                nodes.push(r?);
+            }
+        }
+
+        // (c) Distinct file_path rollup, sorted.
+        let mut files: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for n in &nodes {
+            files.insert(n.file_path.clone());
+        }
+        let files: Vec<String> = files.into_iter().collect();
+        let total_count = nodes.len();
+        Ok(BlastImpact { nodes, files, total_count })
+    }
+
+    /// Count of nodes in the graph that match the entry-point heuristic used
+    /// by `dead_code()`. Used by the engine to fill in
+    /// `DeadCodeReport::entry_points`.
+    pub fn entry_point_count(&self) -> GraphResult<usize> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes
+             WHERE valid = 1
+               AND (
+                   name IN ('main','index','__init__')
+                   OR file_path LIKE '%/bin/%'
+                   OR file_path LIKE '%/main.%'
+                   OR file_path LIKE '%/index.%'
+                   OR is_exported = 1
+                   OR COALESCE(visibility, '') IN ('public','pub')
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
 }
 
 #[cfg(test)]
@@ -967,5 +1294,137 @@ mod tests {
             .unwrap();
         srcs.sort();
         assert_eq!(srcs, vec!["file:src/a.rs".to_string(), "file:src/b.rs".to_string()]);
+    }
+
+    /// Helper: build a node with a specific id, file, kind, exported flag.
+    fn mk_typed_node(id: &str, file: &str, kind: NodeKind, exported: bool) -> Node {
+        let mut n = mk_node(id, file);
+        n.kind = kind;
+        n.is_exported = exported;
+        n
+    }
+
+    #[test]
+    fn dead_code_excludes_called_and_entry_points() {
+        let (_dir, s) = fresh();
+        // `a` is called by no one → would be dead; `b` is called by `a` so
+        // it's reached → not dead.
+        s.upsert_node(&mk_node("function:a:L1", "src/lib.rs")).unwrap();
+        s.upsert_node(&mk_node("function:b:L1", "src/lib.rs")).unwrap();
+        s.upsert_edge(&mk_edge("e1", "function:a:L1", "function:b:L1"))
+            .unwrap();
+        // `c` is exported, no callers — but is an entry point → excluded.
+        s.upsert_node(&mk_typed_node(
+            "function:c:L1",
+            "src/lib.rs",
+            NodeKind::Function,
+            true,
+        ))
+        .unwrap();
+        // `d` is named `main` in bin/main.rs → entry point → excluded.
+        s.upsert_node(&mk_typed_node(
+            "function:d:L1",
+            "bin/main.rs",
+            NodeKind::Function,
+            false,
+        ))
+        .unwrap();
+
+        let entries = s.dead_code().unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.node.id.as_str()).collect();
+        assert!(
+            names.contains(&"function:a:L1"),
+            "a has no callers and is not an entry point → must be flagged, got {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"function:b:L1"),
+            "b is called by a → not dead, got {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"function:c:L1"),
+            "c is exported → not dead, got {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"function:d:L1"),
+            "d is named 'main' → not dead, got {:?}",
+            names
+        );
+
+        // entry_point_count confirms the heuristic picks up `c` and `d`.
+        let epc = s.entry_point_count().unwrap();
+        assert!(epc >= 2, "expected ≥2 entry points (c exported + d main), got {epc}");
+    }
+
+
+    #[test]
+    fn nodes_for_files_groups_correctly() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:f1:L1", "src/lib.rs")).unwrap();
+        s.upsert_node(&mk_node("function:f2:L1", "src/lib.rs")).unwrap();
+
+        s.upsert_node(&mk_node("function:u1:L1", "src/util.rs")).unwrap();
+        // Variable node — not a definition kind → ignored by nodes_for_files.
+        let mut non_def = mk_node("non_def:x:L1", "docs/x.md");
+        non_def.kind = NodeKind::Variable;
+        s.upsert_node(&non_def).unwrap();
+
+        let seeds = s
+            .nodes_for_files(&["src/lib.rs".into(), "src/util.rs".into()])
+            .unwrap();
+        assert_eq!(seeds.len(), 2, "two requested files, got {:?}", seeds.len());
+        // Output preserves the input order of requested paths.
+        assert_eq!(seeds[0].file_path, "src/lib.rs");
+        assert_eq!(seeds[1].file_path, "src/util.rs");
+        assert_eq!(seeds[0].nodes.len(), 2);
+        assert_eq!(seeds[1].nodes.len(), 1);
+
+        // docs/x.md had only a non-definition node → must not appear in seeds.
+        assert!(!seeds.iter().any(|g| g.file_path == "docs/x.md"));
+    }
+
+    #[test]
+    fn reachable_calls_inbound() {
+        let (_dir, s) = fresh();
+        // Chain: a -> b -> c -> d, plus an unrelated branch y.
+        for id in ["a", "b", "c", "d", "y"] {
+            s.upsert_node(&mk_node(&format!("function:{id}:L1"), "src/lib.rs"))
+                .unwrap();
+        }
+        s.upsert_edge(&mk_edge("e1", "function:a:L1", "function:b:L1"))
+            .unwrap();
+        s.upsert_edge(&mk_edge("e2", "function:b:L1", "function:c:L1"))
+            .unwrap();
+        s.upsert_edge(&mk_edge("e3", "function:c:L1", "function:d:L1"))
+            .unwrap();
+
+        // depth=2 from seeds={d}: c is reached in 1 hop, b in 2 hops. a is 3
+        // hops away so NOT reached. y is unrelated.
+        let impact = s
+            .reachable_calls(
+                &["function:d:L1".into()],
+                2,
+                BlastDirection::Inbound,
+            )
+            .unwrap();
+        let ids: std::collections::BTreeSet<&str> =
+            impact.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains("function:c:L1"), "c reachable in 1 hop, got {:?}", ids);
+        assert!(ids.contains("function:b:L1"), "b reachable in 2 hops, got {:?}", ids);
+        assert!(!ids.contains("function:a:L1"), "a is 3 hops — out of range, got {:?}", ids);
+        assert!(!ids.contains("function:d:L1"), "seed must be excluded, got {:?}", ids);
+
+        // depth=1 from {d} → only c.
+        let impact = s
+            .reachable_calls(
+                &["function:d:L1".into()],
+                1,
+                BlastDirection::Inbound,
+            )
+            .unwrap();
+        assert_eq!(impact.total_count, 1);
+        assert_eq!(impact.nodes[0].id, "function:c:L1");
     }
 }

@@ -423,3 +423,71 @@ pub struct SearchCodeResponse {
     pub results: Vec<SearchCodeMatch>,
     pub truncated: bool,
 }
+
+// =============================================================================
+// Dead code + Blast radius analysis
+// =============================================================================
+
+/// One dead-code candidate. `reasons_excluded_from_entry` lists the criteria
+/// the row matched (so the caller can tell *why* it survived the entry-point
+/// filter). Empty when the node had no callers — that's the actual dead case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadCodeEntry {
+    pub node: Node,
+    pub reasons_excluded_from_entry: Vec<String>,
+}
+
+/// Aggregate dead-code report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadCodeReport {
+    /// Total callable nodes (`function`/`method`/`test`) currently in the graph.
+    pub total_functions: usize,
+    /// Subset that matched the entry-point heuristic and therefore were
+    /// excluded from `entries`.
+    pub entry_points: usize,
+    /// `entries.len()` for convenience.
+    pub dead_count: usize,
+    pub entries: Vec<DeadCodeEntry>,
+}
+
+/// One direction of a blast-radius query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlastDirection {
+    /// Transitive CALLERS of the changed code (default).
+    Inbound,
+    /// Transitive CALLEES — what the change depends on.
+    Outbound,
+    /// Union of inbound + outbound.
+    Both,
+}
+
+impl Default for BlastDirection {
+    fn default() -> Self { Self::Inbound }
+}
+
+/// One file plus the definitions (function/class/struct/...) that live in it.
+/// Files with zero matching definitions are not returned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastSeed {
+    pub file_path: String,
+    pub nodes: Vec<Node>,
+}
+
+/// The transitive reachability set of a blast query, plus a file rollup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastImpact {
+    pub nodes: Vec<Node>,
+    /// Distinct `file_path` of impacted nodes, sorted.
+    pub files: Vec<String>,
+    /// `nodes.len()` for convenience.
+    pub total_count: usize,
+}
+
+/// Aggregate blast-radius report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastRadiusReport {
+    pub base_ref: Option<String>,
+    pub changed_files: Vec<String>,
+    pub seeds: Vec<BlastSeed>,
+    pub impact: BlastImpact,
+}
