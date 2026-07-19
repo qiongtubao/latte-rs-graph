@@ -9,6 +9,7 @@ use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 use crate::storage::SqliteStorage;
 use crate::traits::GraphProvider;
 use crate::types::*;
+use crate::engine::metrics::compute_metrics;
 
 // =============================================================================
 // Language Registration
@@ -225,7 +226,39 @@ impl TreeSitterEngine {
                         let node_id = format!("{}:{}:L{}", kind.as_str(), name, start.row + 1);
                         let sig = extract_signature(&content, start.row, full_start.row);
 
-                        nodes.push(Node {
+                        // Compute complexity metrics on the function body.
+                        // ts_node is whatever the query captured (often just
+                        // the function-name identifier); walk up to the
+                        // enclosing function definition so metrics see the
+                        // full body. If nothing qualifies, fall back to
+                        // ts_node itself.
+                        let metrics_root = {
+                            let mut n = ts_node;
+                            loop {
+                                let k = n.kind();
+                                if k.ends_with("_item")
+                                    || k.ends_with("_definition")
+                                    || k == "function"
+                                    || k == "method"
+                                    || k == "method_definition"
+                                {
+                                    break n;
+                                }
+                                match n.parent() {
+                                    Some(p) => n = p,
+                                    None => break ts_node,
+                                }
+                            }
+                        };
+                        let metrics = compute_metrics(
+                            content.as_bytes(),
+                            metrics_root,
+                            &name,
+                            lang.name,
+                        );
+                        let extra = crate::engine::metrics::metrics_to_extra(&metrics);
+
+                        let node = Node {
                             id: node_id.clone(),
                             kind: def_kind,
                             name,
@@ -243,8 +276,9 @@ impl TreeSitterEngine {
                             is_async: false,
                             is_static: false,
                             is_abstract: false,
-                            extra: HashMap::new(),
-                        });
+                            extra,
+                        };
+                        nodes.push(node);
 
                         edges.push(Edge {
                             id: Uuid::new_v4().to_string(),
@@ -637,6 +671,28 @@ impl GraphProvider for TreeSitterEngine {
                                 e
                             ));
                         }
+
+                        // Track the file so downstream tools (notably grep)
+                        // can find the candidate set without scanning disk.
+                        let relative = file_path
+                            .strip_prefix(root)
+                            .unwrap_or(file_path)
+                            .to_string_lossy()
+                            .to_string();
+                        let now = chrono::Utc::now().timestamp();
+                        let mtime = std::fs::metadata(file_path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let _ = self.storage.upsert_file(&FileRecord {
+                            path: relative,
+                            language: lang.name.to_string(),
+                            mtime,
+                            content_hash: String::new(),
+                            indexed_at: now,
+                        });
                     }
                     Err(e) => {
                         stats
@@ -806,6 +862,19 @@ impl GraphProvider for TreeSitterEngine {
 
     async fn clear(&self) -> GraphResult<()> {
         self.storage.clear_all()
+    }
+
+    async fn search_code(
+        &self,
+        project_root: &Path,
+        req: &SearchCodeRequest,
+    ) -> GraphResult<SearchCodeResponse> {
+        crate::query::grep::search_code(&self.storage, project_root, req)
+    }
+
+    async fn complexity(&self, node_id: &str) -> GraphResult<Option<ComplexityMetrics>> {
+        let node = self.storage.node_by_id(node_id)?;
+        Ok(node.and_then(|n| crate::engine::metrics::metrics_from_extra(&n.extra)))
     }
 }
 

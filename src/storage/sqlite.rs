@@ -724,6 +724,76 @@ impl SqliteStorage {
             edge_kinds,
         })
     }
+
+    /// Smallest enclosing definition node (`Function`/`Method`/`Class`/
+    /// `Trait`/`Interface`/`Struct`/`Route`) covering `line` in `file_path`.
+    /// Returns the smallest one (innermost by line range).
+    pub fn containing_node_for_line(
+        &self,
+        file_path: &str,
+        line: u32,
+    ) -> GraphResult<Option<Node>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, name, qualified_name, file_path, language,
+                    start_line, end_line, start_column, end_column,
+                    signature, docstring, visibility,
+                    is_exported, is_async, is_static, is_abstract, extra
+             FROM nodes
+             WHERE file_path = ?1
+               AND start_line <= ?2
+               AND end_line >= ?2
+               AND kind IN ('function', 'method', 'class', 'trait', 'interface', 'struct', 'route')
+               AND valid = 1
+             ORDER BY (end_line - start_line) ASC
+             LIMIT 1",
+        )?;
+
+        let mut rows = stmt.query_map(params![file_path, line], |row| {
+            let extra_str: String = row.get(17)?;
+            let extra: HashMap<String, String> =
+                serde_json::from_str(&extra_str).unwrap_or_default();
+
+            Ok(Node {
+                id: row.get(0)?,
+                kind: NodeKind::from_str(&row.get::<_, String>(1)?),
+                name: row.get(2)?,
+                qualified_name: row.get(3)?,
+                file_path: row.get(4)?,
+                language: row.get(5)?,
+                start_line: row.get::<_, i32>(6)? as u32,
+                end_line: row.get::<_, i32>(7)? as u32,
+                start_column: row.get::<_, i32>(8)? as u32,
+                end_column: row.get::<_, i32>(9)? as u32,
+                signature: row.get(10)?,
+                docstring: row.get(11)?,
+                visibility: row.get(12)?,
+                is_exported: row.get::<_, i32>(13)? != 0,
+                is_async: row.get::<_, i32>(14)? != 0,
+                is_static: row.get::<_, i32>(15)? != 0,
+                is_abstract: row.get::<_, i32>(16)? != 0,
+                extra,
+            })
+        })?;
+
+        match rows.next() {
+            Some(Ok(node)) => Ok(Some(node)),
+            Some(Err(error)) => Err(error.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Inbound CALLS edge count for ranking.
+    pub fn in_degree_calls(&self, node_id: &str) -> GraphResult<u32> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE target = ?1 AND kind = 'calls' AND valid = 1",
+            params![node_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
 }
 
 #[cfg(test)]

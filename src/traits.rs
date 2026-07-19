@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::error::GraphResult;
 use crate::types::{
-    BuildOptions, BuildReport, GraphData, GraphStats, Node, RelationResult, SearchOptions,
-    UpdateReport,
+    BuildOptions, BuildReport, ComplexityMetrics, GraphData, GraphStats, Node, RelationResult,
+    SearchCodeRequest, SearchCodeResponse, SearchOptions, UpdateReport,
 };
 
 /// Core trait that every graph engine must implement.
@@ -53,6 +53,20 @@ pub trait GraphProvider: Send + Sync {
 
     /// Get graph statistics.
     async fn stats(&self) -> GraphResult<GraphStats>;
+    /// Graph-augmented code search. Reads each indexed source file, finds
+    /// literal whitespace-AND substring matches, and attaches the smallest
+    /// enclosing definition node. See `query::grep::search_code`.
+    async fn search_code(
+        &self,
+        project_root: &Path,
+        req: &SearchCodeRequest,
+    ) -> GraphResult<SearchCodeResponse>;
+
+    /// Look up the complexity metrics previously stored on a function node
+    /// (cyclomatic, cognitive, max loop depth, alloc/linear-scan-in-loop,
+    /// recursion). Returns `None` if the node has no metrics or doesn't exist.
+    async fn complexity(&self, node_id: &str) -> GraphResult<Option<ComplexityMetrics>>;
+
 
     // =====================================================================
     // Analysis

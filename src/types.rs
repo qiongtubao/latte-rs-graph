@@ -344,3 +344,82 @@ impl Default for SearchOptions {
         }
     }
 }
+
+// =============================================================================
+// Complexity Metrics (computed at parse time, stored in node.extra)
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplexityMetrics {
+    pub cyclomatic: u32,
+    pub cognitive: u32,
+    pub max_loop_depth: u32,
+    pub alloc_in_loop: bool,
+    pub linear_scan_in_loop: bool,
+    pub is_recursive: bool,
+    pub unguarded_recursion: bool,
+}
+
+// === /query/grep types ===
+// =============================================================================
+// Graph-augmented code search (search_code)
+// =============================================================================
+
+/// How to render each hit in the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchCodeMode {
+    /// Just the small enclosing node + snippet + count.
+    Compact,
+    /// Just file paths that contain a hit; no snippet or per-file counts.
+    Files,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HitKind {
+    /// Hit landed on a defining node (Function/Method/Class/Struct/Trait/Interface/Route).
+    Definition,
+    /// Hit landed on a non-test, non-definition node (e.g. inside a function body).
+    Usage,
+    /// Hit landed on a Test-kind node.
+    Test,
+}
+
+/// Inputs to `search_code`.
+#[derive(Debug, Clone)]
+pub struct SearchCodeRequest {
+    /// Pattern. `regex=false` → literal substring (v1 only mode).
+    pub pattern: String,
+    /// Reserved for future. Substring search in v1 even if true.
+    pub regex: bool,
+    /// If set, only files whose extension matches.
+    pub file_extensions: Option<Vec<String>>,
+    /// If set, regex must match the file path (anchored match from position 0).
+    pub path_filter: Option<String>,
+    pub mode: SearchCodeMode,
+    pub context_lines: u32,
+    pub limit: usize,
+}
+
+/// One hit, deduplicated to the enclosing graph node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchCodeMatch {
+    /// Smallest enclosing definition node, if any. None = hit on top-level (file body).
+    pub containing_node: Option<Node>,
+    pub file_path: String,
+    pub line: u32,
+    pub col: u32,
+    pub snippet: String,
+    /// Raw grep hits inside the containing_node (1 if no enclosing node).
+    pub match_count: usize,
+    pub hit_kind: HitKind,
+    /// Inbound CALLS edges to containing_node. 0 if None. For ranking.
+    pub in_degree: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchCodeResponse {
+    pub total_grep_matches: usize,
+    pub total_results: usize,
+    pub results: Vec<SearchCodeMatch>,
+    pub truncated: bool,
+}

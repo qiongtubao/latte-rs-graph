@@ -136,4 +136,47 @@ impl MemoryStorage {
         self.files.write().map_err(|e| GraphError::Engine(e.to_string()))?.clear();
         Ok(())
     }
+
+    /// Smallest enclosing definition node covering `line` in `file_path`.
+    pub fn containing_node_for_line(
+        &self,
+        file_path: &str,
+        line: u32,
+    ) -> GraphResult<Option<Node>> {
+        let nodes = self
+            .nodes
+            .read()
+            .map_err(|e| GraphError::Engine(e.to_string()))?;
+        Ok(nodes
+            .values()
+            .filter(|node| {
+                node.file_path == file_path
+                    && node.start_line <= line
+                    && node.end_line >= line
+                    && matches!(
+                        &node.kind,
+                        NodeKind::Function
+                            | NodeKind::Method
+                            | NodeKind::Class
+                            | NodeKind::Trait
+                            | NodeKind::Interface
+                            | NodeKind::Struct
+                            | NodeKind::Route
+                    )
+            })
+            .min_by_key(|node| node.end_line.saturating_sub(node.start_line))
+            .cloned())
+    }
+
+    /// Inbound CALLS edge count for ranking.
+    pub fn in_degree_calls(&self, node_id: &str) -> GraphResult<u32> {
+        let edges = self
+            .edges
+            .read()
+            .map_err(|e| GraphError::Engine(e.to_string()))?;
+        Ok(edges
+            .iter()
+            .filter(|edge| edge.target == node_id && edge.kind == EdgeKind::Calls)
+            .count() as u32)
+    }
 }

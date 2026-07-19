@@ -427,6 +427,7 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
