@@ -70,7 +70,7 @@ pub fn plan(query: &CypherQuery) -> Result<SqlPlan, String> {
     // applies it. This keeps things simple while leaving the door open
     // for richer pushdown later.
 
-    match &query.match_clause.pattern {
+    match &query.match_clauses[0].pattern {
         Pattern::SingleNode(np) => Ok(SqlPlan {
             kind: PlanKind::SingleNode {
                 var: np.var.clone(),

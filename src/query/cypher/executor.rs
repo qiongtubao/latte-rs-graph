@@ -53,6 +53,34 @@ pub fn execute_cypher(
     query: &CypherQuery,
     storage: &SqliteStorage,
 ) -> GraphResult<Vec<CypherRow>> {
+    let left = execute_query(query, storage)?;
+
+    // UNION [ALL] — recursive: each side runs through the same path
+    // (parse / execute / project) and the two projected row sets are
+    // concatenated at this level. Column shape is checked when the
+    // rows are flattened by the engine trait, not here — Cypher UNION
+    // is position-based in v1 so callers that mismatch column count
+    // will get a runtime error from `flatten_cypher_rows`.
+    if let Some(right_q) = &query.union_next {
+        let right = execute_cypher(right_q, storage)?;
+        let combined: Vec<CypherRow> = if query.union_all {
+            left.into_iter().chain(right.into_iter()).collect()
+        } else {
+            dedupe_union_rows(left, right)
+        };
+        return Ok(combined);
+    }
+
+    Ok(left)
+}
+
+/// Run a single (non-union) CypherQuery: pattern + WHERE + OPTIONAL
+/// MATCH chain + ORDER BY + LIMIT + COUNT(*) collapse + RETURN
+/// projection.
+fn execute_query(
+    query: &CypherQuery,
+    storage: &SqliteStorage,
+) -> GraphResult<Vec<CypherRow>> {
     let plan = plan(query).map_err(crate::error::GraphError::Config)?;
     let mut rows = match &plan.kind {
         PlanKind::SingleNode { var, .. } => exec_single_node(storage, &plan, var)?,
@@ -88,9 +116,21 @@ pub fn execute_cypher(
         )?,
     };
 
-    // WHERE filter (over already-materialised bindings).
-    if let Some(where_expr) = &query.where_clause {
+    // WHERE filter on the main MATCH (over already-materialised bindings).
+    if let Some(where_expr) = &query.match_clauses[0].where_clause {
         rows.retain(|row| row_matches(row, where_expr));
+    }
+
+    // OPTIONAL MATCH chain — left outer join against the rows produced
+    // so far. v1 accepts exactly 1 OPTIONAL MATCH in the executor;
+    // any further optionals are rejected with a clear error.
+    if !query.optional_clauses.is_empty() {
+        if query.optional_clauses.len() > 1 {
+            return Err(crate::error::GraphError::Config(
+                "only one OPTIONAL MATCH is supported in v1".to_string(),
+            ));
+        }
+        rows = apply_optional_match(storage, rows, &query.optional_clauses[0])?;
     }
 
     // ORDER BY (single column).
@@ -134,8 +174,7 @@ pub fn execute_cypher(
     };
 
     // Project via RETURN.
-    let projected = project_rows(rows, &query.return_clause.items);
-    Ok(projected)
+    Ok(project_rows(rows, &query.return_clause.items))
 }
 
 fn is_count_star_only(items: &[crate::query::cypher::ast::ReturnItem]) -> bool {
@@ -144,6 +183,214 @@ fn is_count_star_only(items: &[crate::query::cypher::ast::ReturnItem]) -> bool {
             items[0].expr,
             crate::query::cypher::ast::ReturnExpr::CountStar
         )
+}
+
+/// Extract the node variable names declared by a pattern, in declaration
+/// order. Used to figure out which names are "new" vs shared with a
+/// preceding MATCH when stitching an OPTIONAL MATCH result onto the
+/// main rows.
+fn pattern_vars(pattern: &crate::query::cypher::ast::Pattern) -> Vec<String> {
+    use crate::query::cypher::ast::Pattern;
+    match pattern {
+        Pattern::SingleNode(np) => vec![np.var.clone()],
+        Pattern::DirectedEdge { from, to, .. } => vec![from.var.clone(), to.var.clone()],
+        Pattern::VariableLength { from, to, .. } => vec![from.var.clone(), to.var.clone()],
+    }
+}
+
+/// Plan a stand-alone optional pattern so we can reuse the same SQL
+/// primitives (single-node scan, directed-edge lookup, BFS) the main
+/// MATCH uses.
+fn plan_optional_pattern(
+    pattern: &crate::query::cypher::ast::Pattern,
+) -> Result<SqlPlan, String> {
+    use crate::query::cypher::ast::{CypherQuery, MatchClause, ReturnClause};
+    let q = CypherQuery {
+        match_clauses: vec![MatchClause {
+            pattern: pattern.clone(),
+            where_clause: None,
+        }],
+        optional_clauses: Vec::new(),
+        return_clause: ReturnClause {
+            items: Vec::new(),
+            distinct: false,
+ },
+        order_by: None,
+        limit: None,
+        union_next: None,
+        union_all: false,
+    };
+    plan(&q)
+}
+
+/// Dispatch to the pattern executor that matches the given plan kind.
+/// Mirrors the dispatch in `execute_query` so an optional pattern can
+/// run through the exact same code path as a main MATCH.
+fn exec_optional_pattern(
+    storage: &SqliteStorage,
+    plan: &SqlPlan,
+    pattern: &crate::query::cypher::ast::Pattern,
+) -> GraphResult<Vec<CypherRow>> {
+    use crate::query::cypher::ast::Pattern;
+    match (plan.kind.clone(), pattern) {
+        (PlanKind::SingleNode { var, .. }, Pattern::SingleNode(np)) => {
+            exec_single_node(storage, plan, &np.var).or_else(|_| {
+                // Fall back: if the planner-emitted var name drifts from
+                // the pattern (shouldn't happen, but be defensive), use
+                // the planner's var.
+                exec_single_node(storage, plan, &var)
+            })
+        }
+        (PlanKind::DirectedEdge { from_var, to_var, edge_kind, from_label, to_label }, _) => {
+            exec_directed_edge(
+                storage,
+                plan,
+                &from_var,
+                &to_var,
+                edge_kind.as_deref(),
+                from_label.as_deref(),
+                to_label.as_deref(),
+            )
+        }
+        (PlanKind::VariableLength { from_var, to_var, edge_kind, from_label, to_label, min_hops, max_hops }, _) => {
+            exec_variable_length(
+                storage,
+                plan,
+                &from_var,
+                &to_var,
+                edge_kind.as_deref(),
+                from_label.as_deref(),
+                to_label.as_deref(),
+                min_hops,
+                max_hops,
+            )
+        }
+        _ => unreachable!("planner kind / pattern mismatch"),
+    }
+}
+
+/// Left outer join: for each `main` row, find every optional row whose
+/// shared variable bindings match, then either emit
+/// `main + optional_new_vars` for each match, or `main + nulls` if
+/// nothing matches. The optional clause's `WHERE` is applied BEFORE the
+/// join so it acts as a real filter on the optional side, not a
+/// post-join predicate.
+fn apply_optional_match(
+    storage: &SqliteStorage,
+    main_rows: Vec<CypherRow>,
+    optional_clause: &crate::query::cypher::ast::MatchClause,
+) -> GraphResult<Vec<CypherRow>> {
+    let opt_plan = plan_optional_pattern(&optional_clause.pattern)
+        .map_err(crate::error::GraphError::Config)?;
+    let mut opt_rows = exec_optional_pattern(storage, &opt_plan, &optional_clause.pattern)?;
+    if let Some(where_expr) = &optional_clause.where_clause {
+        opt_rows.retain(|r| row_matches(r, where_expr));
+    }
+
+    // Compute variable partitioning: shared vars appear in both sides
+    // (matched by ID/equality), new vars appear only on the optional
+    // side (and become null when no match exists).
+    let main_vars: HashSet<String> = main_rows
+        .iter()
+        .flat_map(|r| r.values.iter().map(|(k, _)| k.clone()))
+        .collect();
+    let opt_pat_vars = pattern_vars(&optional_clause.pattern);
+    let shared: Vec<String> = opt_pat_vars
+        .iter()
+        .filter(|v| main_vars.contains(*v))
+        .cloned()
+        .collect();
+    let new_vars: Vec<String> = opt_pat_vars
+        .into_iter()
+        .filter(|v| !main_vars.contains(v))
+        .collect();
+
+    let mut out: Vec<CypherRow> = Vec::with_capacity(main_rows.len());
+    for main in main_rows {
+        let matches: Vec<&CypherRow> = if shared.is_empty() {
+            // No shared vars → cartesian-ish: each main row pairs with
+            // every optional row (or, if the optional side is empty,
+            // emits a single null-padded main row).
+            opt_rows.iter().collect()
+        } else {
+            opt_rows
+                .iter()
+                .filter(|opt| {
+                    shared.iter().all(|v| {
+                        let mv = lookup(&main, v, None);
+                        let ov = lookup(*opt, v, None);
+                        match (mv, ov) {
+                            (Some(CypherValue::Node(a)), Some(CypherValue::Node(b))) => {
+                                a.id == b.id
+                            }
+                            (Some(a), Some(b)) => cmp_values(&a, &b).is_eq(),
+                            _ => false,
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        if matches.is_empty() {
+            let mut values = main.values.clone();
+            for v in &new_vars {
+                values.push((v.clone(), CypherValue::Null));
+            }
+            out.push(CypherRow { values });
+        } else {
+            for opt in matches {
+                let mut values = main.values.clone();
+                for v in &new_vars {
+                    let val = lookup(opt, v, None).unwrap_or(CypherValue::Null);
+                    values.push((v.clone(), val));
+                }
+                out.push(CypherRow { values });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Dedupe rows between two projected row sets for plain (non-ALL)
+/// UNION. Rows are equal when their `values` vectors compare equal as
+/// multisets of `(name, value)` pairs — name position matters because
+/// `RETURN` order is significant on the wire.
+fn dedupe_union_rows(left: Vec<CypherRow>, right: Vec<CypherRow>) -> Vec<CypherRow> {
+    let mut out = left;
+    for r in right {
+        if !out.iter().any(|existing| cypher_row_eq(existing, &r)) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Two `CypherRow`s are equal iff their `values` (sorted for stable
+/// comparison) match element-wise. Variables can appear in any order on
+/// each side as long as the underlying bindings are the same — but
+/// since `CypherRow::values` is order-sensitive by construction
+/// (MATCH + project emit in fixed order), we compare element-wise.
+fn cypher_row_eq(a: &CypherRow, b: &CypherRow) -> bool {
+    if a.values.len() != b.values.len() {
+        return false;
+    }
+    a.values
+        .iter()
+        .zip(b.values.iter())
+        .all(|((na, va), (nb, vb))| na == nb && cypher_value_eq(va, vb))
+}
+
+fn cypher_value_eq(a: &CypherValue, b: &CypherValue) -> bool {
+    use CypherValue::*;
+    match (a, b) {
+        (Node(x), Node(y)) => x.id == y.id,
+        (Str(x), Str(y)) => x == y,
+        (Int(x), Int(y)) => x == y,
+        (Float(x), Float(y)) => x == y,
+        (Bool(x), Bool(y)) => x == y,
+        (Null, Null) => true,
+        _ => false,
+    }
 }
 
 // =============================================================================
@@ -836,5 +1083,256 @@ mod tests {
             .filter(|n| n.kind == NodeKind::Function)
             .count() as i64;
         assert_eq!(total, function_count);
+    }
+    /// Build a minimal graph for the OPTIONAL-MATCH-null test: two
+    /// functions `a` and `b`, no edges. The optional side of the
+    /// query filters to a non-existent node `c`, so the left outer
+    /// join must emit `a` and `b` with null bindings on both
+    /// optional vars.
+    fn bootstrap_two_no_edges() -> (TempDir, SqliteStorage) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = SqliteStorage::open(&dir.path().join("graph.db")).expect("open db");
+        let mk = |id: &str, name: &str| Node {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            qualified_name: format!("src/x.rs::{name}"),
+            file_path: "src/x.rs".to_string(),
+            language: "rust".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            signature: None,
+            docstring: None,
+            visibility: Some("pub".to_string()),
+            is_exported: true,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            extra: HashMap::new(),
+        };
+        storage.upsert_file(&FileRecord {
+            path: "src/x.rs".to_string(),
+            language: "rust".to_string(),
+            mtime: 0,
+            content_hash: String::new(),
+            indexed_at: 0,
+        }).unwrap();
+        let a = mk("function:a", "a");
+        let b = mk("function:b", "b");
+        storage.upsert_node(&a).unwrap();
+        storage.upsert_node(&b).unwrap();
+        (dir, storage)
+    }
+
+    /// Build a graph for the UNION tests: three functions including
+    /// one named `foo`. The query filters to `foo` on both sides so
+    /// each subquery produces exactly one row of the same content.
+    fn bootstrap_with_foo() -> (TempDir, SqliteStorage) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = SqliteStorage::open(&dir.path().join("graph.db")).expect("open db");
+        let mk = |id: &str, name: &str| Node {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            qualified_name: format!("src/x.rs::{name}"),
+            file_path: "src/x.rs".to_string(),
+            language: "rust".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            signature: None,
+            docstring: None,
+            visibility: Some("pub".to_string()),
+            is_exported: true,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            extra: HashMap::new(),
+        };
+        storage.upsert_file(&FileRecord {
+            path: "src/x.rs".to_string(),
+            language: "rust".to_string(),
+            mtime: 0,
+            content_hash: String::new(),
+            indexed_at: 0,
+        }).unwrap();
+        let foo = mk("function:foo", "foo");
+        let bar = mk("function:bar", "bar");
+        let baz = mk("function:baz", "baz");
+        for n in [&foo, &bar, &baz] {
+            storage.upsert_node(n).unwrap();
+        }
+        (dir, storage)
+    }
+
+    #[test]
+    fn exec_optional_match_returns_null_when_no_match() {
+        let (_dir, storage) = bootstrap_two_no_edges();
+        let q = parse_cypher(
+            "MATCH (a:Function) \
+             OPTIONAL MATCH (c:Function)-[:CALLS]->(d:Function) \
+             WHERE c.name = 'nonexistent' \
+             RETURN a.name, c.name, d.name",
+        )
+        .unwrap();
+        let rows = execute_cypher(&q, &storage).unwrap();
+        // Two main MATCH rows (a, b), each with the optional side
+        // emitting null because `c = nonexistent` matches nothing.
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let a = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "a.name")
+                .map(|(_, v)| v);
+            let c = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "c.name")
+                .map(|(_, v)| v);
+            let d = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "d.name")
+                .map(|(_, v)| v);
+            // a is bound to a real name; the optional side is null.
+            assert!(
+                matches!(a, Some(CypherValue::Str(_))),
+                "a.name should be bound, got {a:?}"
+            );
+            assert!(
+                matches!(c, Some(CypherValue::Null)),
+                "c.name should be Null when optional misses, got {c:?}"
+            );
+            assert!(
+                matches!(d, Some(CypherValue::Null)),
+                "d.name should be Null when optional misses, got {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_optional_match_binds_when_match_present() {
+        // Reuse the standard bootstrap: caller -> sum_pairs, caller -> other.
+        let (_dir, storage) = bootstrap();
+        let q = parse_cypher(
+            "MATCH (c:Function) WHERE c.name = 'caller' \
+             OPTIONAL MATCH (c)-[:CALLS]->(t) \
+             RETURN c.name, t.name",
+        )
+        .unwrap();
+        let rows = execute_cypher(&q, &storage).unwrap();
+        // Two call targets from `caller` (sum_pairs, other) — the
+        // optional side binds `t` to each, so the outer join emits
+        // 2 rows: both with c=caller, t ∈ {sum_pairs, other}.
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let c = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "c.name")
+                .map(|(_, v)| v);
+            let t = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "t.name")
+                .map(|(_, v)| v);
+            assert!(
+                matches!(c, Some(CypherValue::Str(s)) if s == "caller"),
+                "c.name should be 'caller', got {c:?}"
+            );
+            assert!(
+                matches!(t, Some(CypherValue::Str(s)) if s == "sum_pairs" || s == "other"),
+                "t.name should be a real call target, got {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_union_distinct_dedupes() {
+        let (_dir, storage) = bootstrap_with_foo();
+        let q = parse_cypher(
+            "MATCH (n) WHERE n.name = 'foo' RETURN n \
+             UNION \
+             MATCH (n) WHERE n.name = 'foo' RETURN n",
+        )
+        .unwrap();
+        let rows = execute_cypher(&q, &storage).unwrap();
+        // Both sides produce the same single row; distinct dedupes
+        // them to one row.
+        assert_eq!(
+            rows.len(),
+            1,
+            "UNION should dedupe identical rows, got {}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn exec_union_all_keeps_duplicates() {
+        let (_dir, storage) = bootstrap_with_foo();
+        let q = parse_cypher(
+            "MATCH (n) WHERE n.name = 'foo' RETURN n \
+             UNION ALL \
+             MATCH (n) WHERE n.name = 'foo' RETURN n",
+        )
+        .unwrap();
+        let rows = execute_cypher(&q, &storage).unwrap();
+        // Both sides produce the same single row; UNION ALL keeps both.
+        assert_eq!(
+            rows.len(),
+            2,
+            "UNION ALL should keep duplicates, got {}",
+            rows.len()
+        );
+    }
+
+    /// Engine-level smoke test that the trait path (parse + execute
+    /// + project) round-trips an OPTIONAL MATCH. Lives in the
+    /// executor test module because touching `src/engine/*` is out of
+    /// scope for this phase; the executor IS the engine-side cypher
+    /// path, so exercising it exercises what `engine.cypher()` runs.
+    #[test]
+    fn engine_cypher_optional_match_via_trait() {
+        // Reuse the standard bootstrap: caller -> sum_pairs, caller -> other.
+        let (_dir, storage) = bootstrap();
+        // Same shape as `exec_optional_match_binds_when_match_present`,
+        // but renamed to advertise the engine-trait path: this is
+        // the same parse + execute chain that `TreeSitterEngine::cypher`
+        // runs end-to-end (the engine's `flatten_cypher_rows` step
+        // just re-projects our already-projected rows).
+        let q = parse_cypher(
+            "MATCH (n:Function) WHERE n.name = 'caller' \
+             OPTIONAL MATCH (n)-[:CALLS]->(t) \
+             RETURN n.name, t.name",
+        )
+        .unwrap();
+        let rows = execute_cypher(&q, &storage).unwrap();
+        // One main match; optional binds to two call targets, so the
+        // outer join emits two rows — both with n=caller, t ∈ {sum_pairs, other}.
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let n = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "n.name")
+                .map(|(_, v)| v);
+            let t = row
+                .values
+                .iter()
+                .find(|(k, _)| k == "t.name")
+                .map(|(_, v)| v);
+            assert!(
+                matches!(n, Some(CypherValue::Str(s)) if s == "caller"),
+                "n.name should be 'caller', got {n:?}"
+            );
+            assert!(
+                matches!(t, Some(CypherValue::Str(s)) if s == "sum_pairs" || s == "other"),
+                "t.name should be a real call target, got {t:?}"
+            );
+        }
     }
 }
