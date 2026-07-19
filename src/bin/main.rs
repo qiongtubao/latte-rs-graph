@@ -147,6 +147,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List detected HTTP routes and outbound HTTP call sites (Phase 11).
+    HttpRoutes {
+        /// Path to the graph database
+        db: PathBuf,
+        /// Optional framework filter (e.g. "express", "gin", "actix")
+        #[arg(long)]
+        framework: Option<String>,
+        /// Optional method filter (e.g. "GET")
+        #[arg(long)]
+        method: Option<String>,
+    },
+    /// Cross-service route / call-site matching between two graph DBs (Phase 11).
+    CrossService {
+        /// Path to graph database A (server side)
+        db_a: PathBuf,
+        /// Path to graph database B (client side)
+        db_b: PathBuf,
+        /// Minimum confidence to emit (default 0.5)
+        #[arg(long, default_value = "0.5")]
+        min_confidence: f32,
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
     /// Execute a Cypher query against the graph and print the result
     /// as JSON rows (Phase 5 subset).
     Cypher {
@@ -496,13 +520,27 @@ async fn main() -> GraphResult<()> {
             let all_callables = engine.graph_data().await?;
             run_sem_similar(&seeds, &all_callables, &function, top_n, json)?;
         }
+        Command::HttpRoutes { db, framework, method } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+            let routes = engine.route_records_by_role("").await?;
+            render_http_routes(&routes, framework.as_deref(), method.as_deref());
+        }
+        Command::CrossService { db_a, db_b, min_confidence, json } => {
+            let storage_a = SqliteStorage::open_readonly(&db_a)?;
+            let storage_b = SqliteStorage::open_readonly(&db_b)?;
+            let engine_a = TreeSitterEngine::new(storage_a);
+            let engine_b = TreeSitterEngine::new(storage_b);
+            let server_routes = engine_a.route_records_by_role("server").await?;
+            let client_routes = engine_b.route_records_by_role("client").await?;
+            run_cross_service(
+                &db_a, &server_routes, &db_b, &client_routes, min_confidence, json,
+            );
+        }
         Command::Cypher { db, query } => {
             let storage = SqliteStorage::open_readonly(&db)?;
             let engine = TreeSitterEngine::new(storage);
             let report = engine.cypher(&query).await?;
-            let s = serde_json::to_string_pretty(&report)
-                .map_err(latte_rs_graph::error::GraphError::Serde)?;
-            println!("{s}");
         }
      }
     Ok(())
@@ -924,4 +962,109 @@ fn is_callable(kind: &latte_rs_graph::types::NodeKind) -> bool {
         kind,
         Function | Method | Class | Struct | Trait | Interface | Constructor | Route
     )
+}
+
+// =============================================================================
+// lrg http-routes / cross-service — Phase 11 CLI
+// =============================================================================
+
+/// Pretty-print HTTP routes + call sites to stdout. Optional filters narrow
+/// by framework (e.g. "express", "gin", "actix") and method (e.g. "GET").
+fn render_http_routes(
+    routes: &[latte_rs_graph::types::RouteRecord],
+    framework: Option<&str>,
+    method: Option<&str>,
+) {
+    let mut filtered: Vec<&latte_rs_graph::types::RouteRecord> = routes
+        .iter()
+        .filter(|r| framework.map_or(true, |f| r.framework == f))
+        .filter(|r| method.map_or(true, |m| r.method.eq_ignore_ascii_case(m)))
+        .collect();
+    // Stable order: server first, then by (method, path) for diffability.
+    filtered.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then_with(|| a.method.cmp(&b.method))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    println!("🛣  HTTP routes ({} total)", filtered.len());
+    if filtered.is_empty() {
+        println!("   (no routes matched the filter — was this graph built before Phase 11?)");
+        return;
+    }
+    for r in &filtered {
+        let role_label = match r.role.as_str() {
+            "server" => "srv",
+            "client" => "cli",
+            other => other,
+ };
+        println!(
+            "   [{role_label:<3}] {method:<6}  {path:<32}  {framework:<10}  {file}:{line}",
+            role_label = role_label,
+            method = r.method,
+            path = r.path,
+            framework = r.framework,
+            file = r.file_path,
+            line = r.start_line,
+        );
+    }
+}
+
+/// Run the cross-service matcher and emit either human-readable or JSON
+/// output. Returns `()`; errors are surfaced via the `?` operator on the
+/// `GraphResult` returned from main.
+fn run_cross_service(
+    db_a: &std::path::Path,
+    server_routes: &[latte_rs_graph::types::RouteRecord],
+    db_b: &std::path::Path,
+    client_routes: &[latte_rs_graph::types::RouteRecord],
+    min_confidence: f32,
+    json: bool,
+) {
+    let a_label = db_a.display().to_string();
+    let b_label = db_b.display().to_string();
+    let candidates = latte_rs_graph::engine::http::cross_service_candidates(
+        latte_rs_graph::engine::http::CrossServiceInput {
+            project: &a_label,
+            routes: server_routes,
+        },
+        latte_rs_graph::engine::http::CrossServiceInput {
+            project: &b_label,
+            routes: client_routes,
+        },
+        min_confidence,
+    );
+    if json {
+        let s = serde_json::to_string_pretty(&candidates)
+            .map_err(latte_rs_graph::error::GraphError::Serde)
+            .expect("serialize candidates");
+        println!("{s}");
+        return;
+    }
+    println!(
+        "🔗 cross-service candidates  (A={}, B={}, min_confidence={:.2})",
+        a_label, b_label, min_confidence
+    );
+    if candidates.is_empty() {
+        println!("   (no matches above the confidence threshold)");
+        return;
+    }
+    println!(
+        "   {:<6}  {:<22}  {:<22}  {}",
+        "conf", "server", "client", "where"
+ );
+    for c in &candidates {
+        println!(
+            "   {conf:<6.2}  {sm} {sp:<18}  {cm} {cp:<18}  {sa}:{sl} ↔ {ca}:{cl}",
+            conf = c.confidence,
+            sm = c.server_method,
+            sp = c.server_path,
+            cm = c.client_method,
+            cp = c.client_path,
+            sa = c.server_file,
+            sl = c.server_line,
+            ca = c.client_file,
+            cl = c.client_line,
+        );
+    }
 }

@@ -1566,7 +1566,37 @@ impl SqliteStorage {
 
         Ok(report)
     }
+
+    // ---- Phase 11: HTTP route / call-site accessors ----------------------
+
+    /// All `NodeKind::Route` nodes parsed out as compact [`RouteRecord`]s,
+    /// optionally filtered to the given role (`"server"` or `"client"`).
+    ///
+    /// An empty `role` returns every route — useful when the caller wants
+    /// to roll its own grouping. The conversion reads the per-route
+    /// `http.*` extras populated by the parser in `tree_sitter::parse_file`.
+    pub fn route_records_by_role(&self, role: &str) -> GraphResult<Vec<RouteRecord>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, name, qualified_name, file_path, language,
+                    start_line, end_line, start_column, end_column,
+                    signature, docstring, visibility,
+                    is_exported, is_async, is_static, is_abstract, extra
+             FROM nodes WHERE valid = 1 AND kind = 'route'",
+        )?;
+        let rows = stmt.query_map([], row_to_node)?;
+        let mut out = Vec::new();
+        for node in rows {
+            let node = node?;
+            let rec = node_to_route_record(node);
+            if role.is_empty() || rec.role == role {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
 }
+
 
 
 // ---- Architecture overview helpers (Phase 4) ----------------------------
@@ -1672,6 +1702,46 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         is_abstract: row.get::<_, i32>(16)? != 0,
         extra,
     })
+}
+
+// ---- Phase 11: route-record conversion (private, module-scoped) ---------
+
+/// Project a `Node` of kind `Route` into the compact `RouteRecord` shape
+/// the CLI + cross-service matcher consume. Reads `http.*` extras populated
+/// by the parser in `tree_sitter::parse_file`; falls back to sensible
+/// defaults if any are missing.
+fn node_to_route_record(node: Node) -> RouteRecord {
+    let method = node
+        .extra
+        .get("http.method")
+        .cloned()
+        .unwrap_or_else(|| "*".to_string());
+    let path = node
+        .extra
+        .get("http.path")
+        .cloned()
+        .unwrap_or_else(|| node.name.clone());
+    let framework = node
+        .extra
+        .get("http.framework")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let role = node
+        .extra
+        .get("http.role")
+        .cloned()
+        .unwrap_or_else(|| "server".to_string());
+    let handler_qn = node.extra.get("http.handler_qualified_name").cloned();
+    RouteRecord {
+        method,
+        path,
+        framework,
+        role,
+        file_path: node.file_path,
+        start_line: node.start_line,
+        end_line: node.end_line,
+        handler_qualified_name: handler_qn,
+    }
 }
 
 // ---- FTS5 sync helpers (private, module-scoped) --------------------------

@@ -403,6 +403,162 @@ impl TreeSitterEngine {
             }
         }
 
+        // =================================================================
+        // Phase 11: HTTP route + call-site detection
+        //
+        // After the definition-arm pass (which has populated `nodes` with
+        // function/method bodies that we can attach call edges to), do one
+        // more pass that walks the source text for HTTP-specific patterns
+        // and emits:
+        //   - `NodeKind::Route` nodes for each route definition (server)
+        //   - `NodeKind::Route` nodes for each outbound HTTP call (client,
+        //     distinguishable via `extra["http.role"] == "client"`)
+        //   - a `route_handler` edge connecting a route to its handler
+        //   - an `http_calls` edge connecting the enclosing function to a
+        //     client-role route node
+        //
+        // The existing definition-arm logic is untouched.
+        // =================================================================
+        let http_extract = crate::engine::http::route_extract::extract_routes_and_calls(
+            content.as_bytes(),
+            Some(root),
+            lang.name,
+        );
+
+        // Build a quick lookup of function/method node IDs that contain a
+        // given line so we can attribute outbound calls to their enclosing
+        // callable (best-effort — unknown calls still get the route node).
+        for r in http_extract.routes {
+            let display = if r.path == "/" {
+                format!("{} /", r.method)
+            } else {
+                format!("{} {}", r.method, r.path)
+            };
+            let id = format!(
+                "route:{}:{}:{}:L{}",
+                r.role_label(),
+                r.method,
+                crate::engine::http::route_extract::sanitize_id_segment(&r.path),
+                r.start_line,
+            );
+            let mut extra: HashMap<String, String> = HashMap::new();
+            extra.insert("http.method".into(), r.method.clone());
+            extra.insert("http.path".into(), r.path.clone());
+            extra.insert("http.pattern".into(), crate::types::normalize_http_path(&r.path));
+            extra.insert("http.framework".into(), r.framework.clone());
+            extra.insert("http.role".into(), "server".into());
+            if let Some(qn) = &r.handler_qn {
+                extra.insert("http.handler_qualified_name".into(), qn.clone());
+            }
+            let node = Node {
+                id: id.clone(),
+                kind: NodeKind::Route,
+                name: display.clone(),
+                qualified_name: display,
+                file_path: relative.clone(),
+                language: lang.name.to_string(),
+                start_line: r.start_line,
+                end_line: r.end_line.max(r.start_line),
+                start_column: 0,
+                end_column: 0,
+                signature: None,
+                docstring: None,
+                visibility: None,
+                is_exported: false,
+                is_async: false,
+                is_static: false,
+                is_abstract: false,
+                extra,
+            };
+            nodes.push(node);
+
+            if let Some(qn) = &r.handler_qn {
+                let target = format!(
+                    "function:{}:*",
+                    qn.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                );
+                edges.push(Edge {
+                    id: Uuid::new_v4().to_string(),
+                    source: id.clone(),
+                    target,
+                    kind: EdgeKind::Other("route_handler".into()),
+                    line: r.start_line,
+                    col: 0,
+                    metadata: Some(format!(
+                        r#"{{"framework":"{}"}}"#,
+                        r.framework
+                    )),
+                    provenance: Some("http_detect".into()),
+                });
+            }
+        }
+
+        for c in http_extract.calls {
+            // Find the smallest enclosing function/method node, if any.
+            let caller_qn = nodes
+                .iter()
+                .filter(|n| {
+                    matches!(
+                        n.kind,
+                        NodeKind::Function | NodeKind::Method | NodeKind::Constructor
+                    ) && n.start_line <= c.start_line
+                        && c.start_line <= n.end_line.max(n.start_line)
+                })
+                .min_by_key(|n| n.end_line.saturating_sub(n.start_line))
+                .map(|n| n.id.clone());
+
+            let display = format!("client {} {}", c.method, c.path);
+            let id = format!(
+                "route:client:{}:{}:L{}",
+                c.method,
+                crate::engine::http::route_extract::sanitize_id_segment(&c.path),
+                c.start_line,
+            );
+            let mut extra: HashMap<String, String> = HashMap::new();
+            extra.insert("http.method".into(), c.method.clone());
+            extra.insert("http.path".into(), c.path.clone());
+            extra.insert("http.pattern".into(), crate::types::normalize_http_path(&c.path));
+            extra.insert("http.framework".into(), c.framework.clone());
+            extra.insert("http.role".into(), "client".into());
+            let node = Node {
+                id: id.clone(),
+                kind: NodeKind::Route,
+                name: display.clone(),
+                qualified_name: display,
+                file_path: relative.clone(),
+                language: lang.name.to_string(),
+                start_line: c.start_line,
+                end_line: c.end_line.max(c.start_line),
+                start_column: 0,
+                end_column: 0,
+                signature: None,
+                docstring: None,
+                visibility: None,
+                is_exported: false,
+                is_async: false,
+                is_static: false,
+                is_abstract: false,
+                extra,
+            };
+            nodes.push(node);
+
+            if let Some(src) = caller_qn {
+                edges.push(Edge {
+                    id: Uuid::new_v4().to_string(),
+                    source: src,
+                    target: id,
+                    kind: EdgeKind::Other("http_calls".into()),
+                    line: c.start_line,
+                    col: 0,
+                    metadata: Some(format!(
+                        r#"{{"method":"{}","framework":"{}"}}"#,
+                        c.method, c.framework
+                    )),
+                    provenance: Some("http_detect".into()),
+                });
+            }
+        }
+
         Ok((nodes, edges))
     }
 
@@ -1087,6 +1243,17 @@ impl GraphProvider for TreeSitterEngine {
 }
 
 impl TreeSitterEngine {
+    /// Phase 11: read the HTTP route records out of the storage.
+    ///
+    /// `role = ""` returns every route (server + client). The CLI uses this
+    /// for `lrg http-routes` and as the per-side input to
+    /// `lrg cross-service`. Lives on the inherent impl (not on the
+    /// `GraphProvider` trait) so the trait surface stays untouched.
+    pub async fn route_records_by_role(&self, role: &str) -> GraphResult<Vec<RouteRecord>> {
+        self.storage.route_records_by_role(role)
+    }
+
+    /// Collapse executor rows into the flat `CypherRows` shape the
     /// Collapse executor rows into the flat `CypherRows` shape the
     /// trait (and the CLI JSON) emit. Column names come from
     /// `RETURN` items, preserving the alias when one was given.

@@ -939,3 +939,158 @@ impl Default for SemanticConfig {
         }
     }
 }
+
+// =============================================================================
+// HTTP route + call-site detection (Phase 11)
+// =============================================================================
+
+/// A route (server definition) or HTTP call site (client invocation) detected
+/// during parse. Emitted as a `NodeKind::Route` graph node with `extra["http.*"]`
+/// populated; the role distinguishes the two (`"server"` vs `"client"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteRecord {
+    pub method: String,
+    pub path: String,
+    pub framework: String,
+    pub role: String, // "server" | "client"
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub handler_qualified_name: Option<String>,
+}
+
+/// A confidence-weighted pair emitted by `cross_service_candidates`. Used as
+/// the JSON row shape for `lrg cross-service --json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossServiceCandidate {
+    pub server_path: String,
+    pub server_method: String,
+    pub server_file: String,
+    pub server_line: u32,
+    pub server_framework: String,
+    pub client_path: String,
+    pub client_method: String,
+    pub client_file: String,
+    pub client_line: u32,
+    pub client_framework: String,
+    pub confidence: f32,
+}
+
+/// Normalize an HTTP path for matching: collapse repeated `/`, trim trailing
+/// slashes (except when the whole path is just `"/"`), replace common
+/// template-parameter syntaxes with `*` so `/users/:id` and `/users/{id}` and
+/// `/users/<id>` all collapse to the same pattern.
+///
+/// Examples:
+///   `"/users/"` -> `"/users"`
+///   `"//foo//bar//"` -> `"/foo/bar"`
+///   `"/users/:id"` -> `"/users/*"`
+///   `"/items/{item_id}"` -> `"/items/*"`
+pub fn normalize_http_path(path: &str) -> String {
+    // Collapse runs of '/' to a single '/'. Doing this before the trim keeps
+    // a path that is only slashes from being silently dropped.
+    let mut collapsed = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    // Replace the most common template-param syntaxes with '*' so callers can
+    // collapse Express-style `:id`, FastAPI-style `{item_id}`, and Actix-style
+    // `<id>` into one bucket. We do this segment-by-segment rather than with
+    // a global regex so partial tokens (e.g. ":id_extra") are still replaced.
+    let templated: String = {
+        let mut out = String::with_capacity(collapsed.len());
+        let mut first = true;
+        for seg in collapsed.split('/') {
+            if !first {
+                out.push('/');
+            }
+            first = false;
+            // Express / Actix web :id — colon-prefixed param until a separator.
+            if seg.starts_with(':') && seg.len() > 1 {
+                out.push('*');
+                continue;
+            }
+            // FastAPI / Starlette / Flask {name} — whole-segment curlies.
+            if seg.starts_with('{') && seg.ends_with('}') && seg.len() >= 2 {
+                out.push('*');
+                continue;
+            }
+            // Actix-web raw angle-bracket params <id> — whole-segment.
+            if seg.starts_with('<') && seg.ends_with('>') && seg.len() >= 2 {
+                out.push('*');
+                continue;
+            }
+            // Wildcards already present (warp, etc).
+            if seg == "*" || seg == "*rest" {
+                out.push('*');
+                continue;
+            }
+            out.push_str(seg);
+        }
+        out
+    };
+    // Trim trailing slash (but keep a lone "/" intact).
+    let trimmed = templated.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    trimmed.to_string()
+}
+/// Split a normalized path into its non-empty segments. Used by the
+/// cross-service matcher to compare structural similarity (`/users/:id` and
+/// `/users/42` share the same segment count and segment-0 = "users").
+///
+/// Returns owned `String`s because the normalized path is a temporary
+/// `String` and `&str` would dangle as soon as the function returns.
+pub fn path_segments(path: &str) -> Vec<String> {
+    normalize_http_path(path)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+#[cfg(test)]
+mod http_path_tests {
+    use super::{normalize_http_path, path_segments};
+
+    #[test]
+    fn strips_trailing_slash() {
+        assert_eq!(normalize_http_path("/users/"), "/users");
+    }
+
+    #[test]
+    fn collapses_double_slash() {
+        assert_eq!(normalize_http_path("//foo//bar//"), "/foo/bar");
+    }
+
+    #[test]
+    fn keeps_root() {
+        assert_eq!(normalize_http_path("/"), "/");
+        assert_eq!(normalize_http_path("//"), "/");
+    }
+
+    #[test]
+    fn express_param_collapses_to_star() {
+        assert_eq!(normalize_http_path("/users/:id"), "/users/*");
+    }
+
+    #[test]
+    fn fastapi_curly_collapses_to_star() {
+        assert_eq!(normalize_http_path("/items/{item_id}"), "/items/*");
+    }
+
+    #[test]
+    fn segments_skip_empty() {
+        assert_eq!(path_segments("/users/"), vec!["users".to_string()]);
+        assert_eq!(path_segments("/users/:id"), vec!["users".to_string(), "*".to_string()]);
+    }
+}
