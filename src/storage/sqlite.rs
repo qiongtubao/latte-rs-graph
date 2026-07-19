@@ -1079,6 +1079,537 @@ impl SqliteStorage {
         let rows = stmt.query_map(params![limit as i64], row_to_node)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    // =========================================================================
+    // Architecture overview (Phase 4)
+    // =========================================================================
+
+    /// Multi-aspect architecture query. Runs one SQL aggregation per
+    /// requested aspect and assembles the result into `ArchitectureReport`.
+    /// `Clusters` and `Cycles` are silently skipped (deferred to Phase 5).
+    pub fn architecture_overview(
+        &self,
+        req: &ArchitectureRequest,
+    ) -> GraphResult<ArchitectureReport> {
+        // Sanitize the path scope once. CLI args only, but we still
+        // refuse quote/semicolon/backslash so a stray flag value can
+        // never inject into our hand-built SQL fragments below.
+        if let Some(scope) = &req.path_scope {
+            if scope.contains('\'') || scope.contains(';') || scope.contains('\\') {
+                return Err(GraphError::Engine(format!(
+                    "invalid path_scope (must not contain ' ; or \\): {scope}"
+                )));
+            }
+        }
+        let scope_frag = match &req.path_scope {
+            Some(s) => format!(" AND (file_path = '{s}' OR file_path LIKE '{s}%')"),
+            None => String::new(),
+        };
+        let aspects = if req.aspects.is_empty() {
+            ArchitectureAspect::default_set()
+        } else {
+            req.aspects.clone()
+        };
+        let top_n = req.top_n.max(1);
+        let wants = |a: ArchitectureAspect| aspects.contains(&a);
+
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+
+        let mut report = ArchitectureReport {
+            requested_aspects: aspects.clone(),
+            path_scope: req.path_scope.clone(),
+            ..Default::default()
+        };
+
+        // ----- Overview ----------------------------------------------------
+        if wants(ArchitectureAspect::Overview) {
+            let total_nodes: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM nodes WHERE valid = 1{}", scope_frag),
+                [],
+                |r| r.get(0),
+            )?;
+            let total_edges: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE valid = 1",
+                [],
+                |r| r.get(0),
+            )?;
+            let total_files: i64 = if req.path_scope.is_some() {
+                conn.query_row(
+                    &format!(
+                        "SELECT COUNT(DISTINCT file_path) FROM nodes WHERE valid = 1{}",
+                        scope_frag
+                    ),
+                    [],
+                    |r| r.get(0),
+                )?
+            } else {
+                conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?
+            };
+            let total_routes: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM nodes WHERE valid = 1 AND kind = 'route'{}",
+                    scope_frag
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            let languages_count: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT language) FROM nodes WHERE valid = 1{}",
+                    scope_frag
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            let entry_points_count: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM nodes
+                     WHERE valid = 1 AND (
+                         name IN ('main','index','__init__')
+                         OR file_path LIKE '%/bin/%'
+                         OR file_path LIKE '%/main.%'
+                         OR file_path LIKE '%/index.%'
+                         OR is_exported = 1
+                         OR COALESCE(visibility, '') IN ('public','pub')
+                     ){}",
+                    scope_frag
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            let dead_count: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM nodes
+                     WHERE valid = 1
+                       AND kind IN ('function','method','test')
+                       AND id NOT IN (SELECT target FROM edges WHERE kind='calls' AND valid=1)
+                       AND NOT (
+                           name IN ('main','index','__init__')
+                           OR file_path LIKE '%/bin/%'
+                           OR file_path LIKE '%/main.%'
+                           OR file_path LIKE '%/index.%'
+                           OR is_exported = 1
+                           OR COALESCE(visibility, '') IN ('public','pub')
+                       ){}",
+                    scope_frag
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            let call_edges_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind = 'calls' AND valid = 1",
+                [],
+                |r| r.get(0),
+            )?;
+            report.overview = Some(OverviewSection {
+                total_nodes: total_nodes as usize,
+                total_edges: total_edges as usize,
+                total_files: total_files as usize,
+                total_routes: total_routes as usize,
+                languages_count: languages_count as usize,
+                entry_points_count: entry_points_count as usize,
+                dead_count: dead_count as usize,
+                call_edges_count: call_edges_count as usize,
+            });
+        }
+
+        // Load scoped node + edge sets once so per-aspect sections can
+        // bucket in Rust rather than issuing fresh SQL per aspect.
+        let scoped_nodes: Vec<Node> = if req.path_scope.is_some() {
+            let s = req.path_scope.as_deref().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, name, qualified_name, file_path, language,
+                        start_line, end_line, start_column, end_column,
+                        signature, docstring, visibility,
+                        is_exported, is_async, is_static, is_abstract, extra
+                 FROM nodes WHERE valid = 1 AND (file_path = ?1 OR file_path LIKE ?2)",
+            )?;
+            let like = format!("{s}/%");
+            let rows = stmt.query_map(params![s, like], row_to_node)?;
+            rows.collect::<Result<_, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, name, qualified_name, file_path, language,
+                        start_line, end_line, start_column, end_column,
+                        signature, docstring, visibility,
+                        is_exported, is_async, is_static, is_abstract, extra
+                 FROM nodes WHERE valid = 1",
+            )?;
+            let rows = stmt.query_map([], row_to_node)?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let id_to_node: HashMap<&str, &Node> =
+            scoped_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let scoped_edges: Vec<(String, String, String, String)> = if req.path_scope.is_some() {
+            let s = req.path_scope.as_deref().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.source, e.target, e.kind
+                 FROM edges e
+                 JOIN nodes s ON s.id = e.source
+                 WHERE e.valid = 1 AND (s.file_path = ?1 OR s.file_path LIKE ?2
+                                        OR EXISTS (SELECT 1 FROM nodes t
+                                                   WHERE t.id = e.target
+                                                     AND (t.file_path = ?3 OR t.file_path LIKE ?4)))",
+            )?;
+            let like = format!("{s}/%");
+            let rows = stmt.query_map(params![s, &like, s, &like], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, source, target, kind FROM edges WHERE valid = 1",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+
+        // ----- Structure / Packages ---------------------------------------
+        if wants(ArchitectureAspect::Structure) || wants(ArchitectureAspect::Packages) {
+            let mut pkg_nodes: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for n in &scoped_nodes {
+                *pkg_nodes.entry(package_of(&n.file_path, 2)).or_default() += 1;
+            }
+            let mut pkg_edges: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (_id, src, tgt, _kind) in &scoped_edges {
+                if let (Some(s), Some(t)) = (id_to_node.get(src.as_str()), id_to_node.get(tgt.as_str())) {
+                    if s.file_path == t.file_path {
+                        continue;
+                    }
+                    let sp = package_of(&s.file_path, 2);
+                    let tp = package_of(&t.file_path, 2);
+                    if sp == tp {
+                        *pkg_edges.entry(sp).or_default() += 1;
+                    }
+                }
+            }
+            let mut rows: Vec<PackageRow> = pkg_nodes
+                .into_iter()
+                .map(|(path, node_count)| PackageRow {
+                    edge_count: *pkg_edges.get(&path).unwrap_or(&0),
+                    node_count,
+                    path,
+                })
+                .collect();
+            rows.sort_by(|a, b| b.node_count.cmp(&a.node_count).then(a.path.cmp(&b.path)));
+            if wants(ArchitectureAspect::Structure) {
+                report.structure = Some(rows.clone());
+            }
+            if wants(ArchitectureAspect::Packages) {
+                rows.truncate(top_n);
+                report.packages = Some(rows);
+            }
+        }
+
+        // ----- Dependencies -----------------------------------------------
+        if wants(ArchitectureAspect::Dependencies) {
+            let mut dep: std::collections::BTreeMap<(String, String), usize> =
+                std::collections::BTreeMap::new();
+            for (_id, src, tgt, kind) in &scoped_edges {
+                if kind != "imports" {
+                    continue;
+                }
+                let (Some(s), Some(t)) =
+                    (id_to_node.get(src.as_str()), id_to_node.get(tgt.as_str())) else { continue; };
+                if s.file_path == t.file_path {
+                    continue;
+                }
+                *dep.entry((s.file_path.clone(), t.file_path.clone())).or_default() += 1;
+            }
+            let mut rows: Vec<DepRow> = dep
+                .into_iter()
+                .map(|((from_path, to_path), edge_count)| DepRow { from_path, to_path, edge_count })
+                .collect();
+            rows.sort_by(|a, b| b.edge_count.cmp(&a.edge_count));
+            rows.truncate(top_n);
+            report.dependencies = Some(rows);
+        }
+
+        // ----- Routes -----------------------------------------------------
+        if wants(ArchitectureAspect::Routes) {
+            let mut rows: Vec<RouteRow> = scoped_nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Route)
+                .map(|n| RouteRow {
+                    id: n.id.clone(),
+                    qualified_name: n.qualified_name.clone(),
+                    file_path: n.file_path.clone(),
+                    start_line: n.start_line,
+                    method: n.extra.get("method").cloned(),
+                    path: n.extra.get("path").cloned(),
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+            });
+            report.routes = Some(rows);
+        }
+
+        // ----- Languages --------------------------------------------------
+        if wants(ArchitectureAspect::Languages) {
+            let mut node_count: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            let mut files: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+                std::collections::BTreeMap::new();
+            for n in &scoped_nodes {
+                *node_count.entry(n.language.as_str()).or_default() += 1;
+                files.entry(n.language.as_str()).or_default().insert(n.file_path.as_str());
+            }
+            let mut edge_count: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for (_id, src, _tgt, _kind) in &scoped_edges {
+                if let Some(s) = id_to_node.get(src.as_str()) {
+                    *edge_count.entry(s.language.as_str()).or_default() += 1;
+                }
+            }
+            let rows: Vec<LanguageRow> = node_count
+                .into_iter()
+                .map(|(language, nc)| LanguageRow {
+                    file_count: files.get(language).map(|s| s.len()).unwrap_or(0),
+                    edge_count: *edge_count.get(language).unwrap_or(&0),
+                    language: language.to_string(),
+                    node_count: nc,
+                })
+                .collect();
+            report.languages = Some(rows);
+        }
+
+        // ----- Entry points -----------------------------------------------
+        if wants(ArchitectureAspect::EntryPoints) {
+            let mut entries: Vec<Node> = scoped_nodes
+                .iter()
+                .filter(|n| is_entry_point(n))
+                .cloned()
+                .collect();
+            entries.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+            entries.truncate(200);
+            report.entry_points = Some(entries);
+        }
+
+        // ----- Hotspots ---------------------------------------------------
+        if wants(ArchitectureAspect::Hotspots) {
+            let mut indeg: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for (_id, _src, tgt, kind) in &scoped_edges {
+                if kind == "calls" {
+                    *indeg.entry(tgt.as_str()).or_default() += 1;
+                }
+            }
+            let mut rows: Vec<HotspotRow> = indeg
+                .into_iter()
+                .filter_map(|(id, deg)| id_to_node.get(id).map(|n| (n, deg)))
+                .map(|(n, in_degree)| HotspotRow { node: (*n).clone(), in_degree })
+                .collect();
+            rows.sort_by(|a, b| b.in_degree.cmp(&a.in_degree).then(a.node.qualified_name.cmp(&b.node.qualified_name)));
+            rows.truncate(top_n);
+            report.hotspots = Some(rows);
+        }
+
+        // ----- Boundaries -------------------------------------------------
+        if wants(ArchitectureAspect::Boundaries) {
+            let mut inbound: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut outbound: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (_id, src, tgt, kind) in &scoped_edges {
+                if kind != "calls" {
+                    continue;
+                }
+                let (Some(s), Some(t)) =
+                    (id_to_node.get(src.as_str()), id_to_node.get(tgt.as_str())) else { continue; };
+                if s.file_path == t.file_path {
+                    continue;
+                }
+                let sp = package_of(&s.file_path, 2);
+                let tp = package_of(&t.file_path, 2);
+                if sp != tp {
+                    *outbound.entry(sp).or_default() += 1;
+                    *inbound.entry(tp).or_default() += 1;
+                }
+            }
+            let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            keys.extend(inbound.keys().cloned());
+            keys.extend(outbound.keys().cloned());
+            let mut rows: Vec<BoundaryRow> = keys
+                .into_iter()
+                .map(|path| {
+                    let ib = *inbound.get(&path).unwrap_or(&0);
+                    let ob = *outbound.get(&path).unwrap_or(&0);
+                    let total = (ib + ob) as f64;
+                    let ratio = if total > 0.0 { ob as f64 / total } else { 0.0 };
+                    BoundaryRow { path, inbound_count: ib, outbound_count: ob, fan_out_ratio: ratio }
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                let ta = a.inbound_count + a.outbound_count;
+                let tb = b.inbound_count + b.outbound_count;
+                tb.cmp(&ta).then(a.path.cmp(&b.path))
+            });
+            rows.truncate(top_n);
+            report.boundaries = Some(rows);
+        }
+
+        // ----- Layers (BFS over CALLS from entry points) ------------------
+        if wants(ArchitectureAspect::Layers) {
+            let entries: Vec<&Node> = scoped_nodes
+                .iter()
+                .filter(|n| is_entry_point(n))
+                .collect();
+            let entry_count = entries.len();
+            let mut layer: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for &seed in &entries {
+                layer.insert(seed.id.clone(), 0);
+            }
+            let mut adj: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (_id, src, tgt, kind) in &scoped_edges {
+                if kind == "calls" {
+                    adj.entry(src.as_str()).or_default().push(tgt.as_str());
+                }
+            }
+            let mut frontier: Vec<&str> = entries.iter().map(|n| n.id.as_str()).collect();
+            let mut max_layer = 0u32;
+            let mut current_layer = 0u32;
+            while !frontier.is_empty() {
+                let mut next: Vec<&str> = Vec::new();
+                for &node in &frontier {
+                    if let Some(targets) = adj.get(node) {
+                        for &t in targets {
+                            if let Some(t_node) = id_to_node.get(t) {
+                                let entry = layer.entry(t_node.id.clone()).or_insert(current_layer + 1);
+                                if *entry < current_layer + 1 {
+                                    *entry = current_layer + 1;
+                                }
+                                next.push(t);
+                            }
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                current_layer += 1;
+                max_layer = current_layer;
+                frontier = next;
+            }
+            let mut per_layer: Vec<usize> = vec![0; (max_layer as usize) + 1];
+            for &l in layer.values() {
+                if (l as usize) < per_layer.len() {
+                    per_layer[l as usize] += 1;
+                }
+            }
+            report.layers = Some(LayersSection {
+                entry_count,
+                max_layer,
+                node_count_per_layer: per_layer,
+            });
+        }
+
+        // ----- File tree --------------------------------------------------
+        if wants(ArchitectureAspect::FileTree) {
+            let root = req.path_scope.clone().unwrap_or_default();
+            let entries = build_file_tree(&scoped_nodes);
+            report.file_tree = Some(FileTree { root, entries });
+        }
+
+        // Clusters / Cycles: silently skipped — see Phase 5 plan.
+
+        Ok(report)
+    }
+}
+
+
+// ---- Architecture overview helpers (Phase 4) ----------------------------
+
+/// Compute the directory prefix of `file_path` up to `depth` segments.
+pub(crate) fn package_of(file_path: &str, depth: usize) -> String {
+    if file_path.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<&str> = file_path.split('/').collect();
+    if !parts.is_empty() {
+        parts.pop();
+    }
+    if depth < parts.len() {
+        parts.truncate(depth);
+    }
+    parts.join("/")
+}
+
+/// Mirror of the entry-point heuristic used by `dead_code`.
+fn is_entry_point(n: &Node) -> bool {
+    if matches!(n.name.as_str(), "main" | "index" | "__init__") {
+        return true;
+    }
+    if n.is_exported {
+        return true;
+    }
+    if matches!(n.visibility.as_deref(), Some("public") | Some("pub")) {
+        return true;
+    }
+    if n.file_path.contains("/bin/")
+        || n.file_path.contains("main.")
+        || n.file_path.contains("index.")
+    {
+        return true;
+    }
+    false
+}
+
+/// Build a nested file tree from distinct `file_path`s. Two-tier
+/// layout: top-level directory → leaf files.
+pub(crate) fn build_file_tree(nodes: &[Node]) -> Vec<FileTreeEntry> {
+    use std::collections::BTreeMap;
+
+    let mut root: BTreeMap<String, Vec<FileTreeEntry>> = BTreeMap::new();
+    let mut paths_seen: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for n in nodes {
+        if !paths_seen.insert(n.file_path.clone()) {
+            continue;
+        }
+        let parts: Vec<&str> = n.file_path.split('/').collect();
+        let top = parts.first().copied().unwrap_or("").to_string();
+        let leaf = parts.last().copied().unwrap_or("").to_string();
+        if leaf.is_empty() || leaf == top {
+            continue;
+        }
+        root.entry(top).or_default().push(FileTreeEntry {
+            name: leaf,
+            kind: "file".to_string(),
+            children: Vec::new(),
+        });
+    }
+    let mut out: Vec<FileTreeEntry> = Vec::new();
+    for (name, mut files) in root {
+        if files.is_empty() && name.is_empty() {
+            continue;
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        out.push(FileTreeEntry {
+            name: if name.is_empty() { "<root>".to_string() } else { name },
+            kind: "directory".to_string(),
+            children: files,
+        });
+    }
+    out
 }
 
 /// Map a SELECT-row over the `nodes` table to a `Node`. Shared by
@@ -1220,6 +1751,14 @@ mod tests {
             metadata: None,
             provenance: None,
         }
+    }
+
+    /// Same shape as `mk_edge` but tagged as `imports` for the
+    /// dependency rollup.
+    fn mk_imp(id: &str, source: &str, target: &str) -> Edge {
+        let mut e = mk_edge(id, source, target);
+        e.kind = EdgeKind::Imports;
+        e
     }
 
     #[test]
@@ -1642,5 +2181,125 @@ mod tests {
 
         let underscored = s.search_nodes("___", 10).unwrap();
         assert_eq!(underscored.len(), 3, "underscore-only query must fall through to recent nodes");
+    }
+
+    // =========================================================================
+    // Phase 4 — architecture overview tests
+    // =========================================================================
+
+    /// Insert 4 function nodes in src/a.rs, 2 in src/b/c.rs, 1 file node
+    /// for each file. Insert 3 import edges. Assert overview counts and
+    /// that `rust` language surfaces.
+    #[test]
+    fn architecture_overview_returns_counts_for_node_kinds() {
+        let (_dir, s) = fresh();
+        for id in ["function:fa1:L1", "function:fa2:L2", "function:fa3:L3", "function:fa4:L4"] {
+            s.upsert_node(&mk_node(id, "src/a.rs")).unwrap();
+        }
+        for id in ["function:fc1:L1", "function:fc2:L2"] {
+            s.upsert_node(&mk_node(id, "src/b/c.rs")).unwrap();
+        }
+        s.upsert_node(&mk_node("file:src/a.rs", "src/a.rs")).unwrap();
+        s.upsert_node(&mk_node("file:src/b/c.rs", "src/b/c.rs")).unwrap();
+
+        s.upsert_edge(&mk_imp("ia_b", "file:src/a.rs", "file:src/b/c.rs")).unwrap();
+        s.upsert_edge(&mk_imp("ib_c", "file:src/b/c.rs", "file:src/b/c.rs")).unwrap();
+        s.upsert_edge(&mk_imp("ia_c", "file:src/a.rs", "file:src/b/c.rs")).unwrap();
+
+        let req = ArchitectureRequest {
+            aspects: vec![ArchitectureAspect::Overview, ArchitectureAspect::Languages],
+            ..Default::default()
+        };
+        let report = s.architecture_overview(&req).unwrap();
+        let o = report.overview.expect("overview populated");
+        assert_eq!(o.total_nodes, 8, "4 funcs + 2 funcs + 2 files = 8 nodes");
+        assert_eq!(o.total_edges, 3, "three import edges inserted");
+        assert_eq!(o.languages_count, 1, "all rust");
+        let langs = report.languages.expect("languages populated");
+        let rust = langs.iter().find(|r| r.language == "rust").expect("rust row");
+        assert_eq!(rust.node_count, 8);
+    }
+
+    /// Same setup, but `path_scope = Some("src/a")`. Structure rollup
+    /// must only contain the in-scope directory.
+    #[test]
+    fn architecture_overview_filters_by_path_scope() {
+        let (_dir, s) = fresh();
+        for id in ["function:fa1:L1", "function:fa2:L2", "function:fa3:L3", "function:fa4:L4"] {
+            s.upsert_node(&mk_node(id, "src/a.rs")).unwrap();
+        }
+        for id in ["function:fc1:L1", "function:fc2:L2"] {
+            s.upsert_node(&mk_node(id, "src/b/c.rs")).unwrap();
+        }
+        s.upsert_node(&mk_node("file:src/a.rs", "src/a.rs")).unwrap();
+        s.upsert_node(&mk_node("file:src/b/c.rs", "src/b/c.rs")).unwrap();
+        s.upsert_edge(&mk_imp("ia_b", "file:src/a.rs", "file:src/b/c.rs")).unwrap();
+
+        let req = ArchitectureRequest {
+            path_scope: Some("src/a".to_string()),
+            aspects: vec![ArchitectureAspect::Structure, ArchitectureAspect::Overview],
+            ..Default::default()
+        };
+        let report = s.architecture_overview(&req).unwrap();
+        let o = report.overview.expect("overview populated");
+        // Scope="src/a" must restrict the overview to the in-scope
+        // nodes only — 4 functions + 1 file in src/a, NOT the 2 funcs
+        // in src/b/c.rs.
+        assert_eq!(o.total_nodes, 5, "4 funcs + 1 file in src/a");
+        let struct_rows = report.structure.expect("structure populated");
+        // No structure bucket may contain a src/b path.
+        for r in &struct_rows {
+            assert!(
+                !r.path.split('/').any(|p| p == "b") || !r.path.starts_with("src"),
+                "src/b should not leak into scoped rollup, got {}",
+                r.path
+            );
+        }
+    }
+
+    /// 4 function nodes (a, b, c, d). Calls edges: a→c, b→c, b→d, a→d, c→d
+    /// (so d=3 inbound, c=2, a=0, b=0). Hotspots with top_n=2 must return
+    /// [d, c].
+    #[test]
+    fn architecture_overview_hotspots_orders_by_inbound() {
+        let (_dir, s) = fresh();
+        for id in ["a", "b", "c", "d"] {
+            s.upsert_node(&mk_node(&format!("function:{id}:L1"), "src/lib.rs")).unwrap();
+        }
+        for (id, src, tgt) in [
+            ("e1", "function:a:L1", "function:c:L1"),
+            ("e2", "function:b:L1", "function:c:L1"),
+            ("e3", "function:b:L1", "function:d:L1"),
+            ("e4", "function:a:L1", "function:d:L1"),
+            ("e5", "function:c:L1", "function:d:L1"),
+        ] {
+            let mut e = mk_edge(id, src, tgt);
+            e.kind = EdgeKind::Calls;
+            s.upsert_edge(&e).unwrap();
+        }
+
+        let req = ArchitectureRequest {
+            aspects: vec![ArchitectureAspect::Hotspots],
+            top_n: 2,
+            ..Default::default()
+        };
+        let report = s.architecture_overview(&req).unwrap();
+        let hs = report.hotspots.expect("hotspots populated");
+        assert_eq!(hs.len(), 2, "top_n=2 should yield 2 hotspots");
+        // mk_node sets `name = id`, so the function named "d" has
+        // node.name == "function:d:L1" (the synthetic id used to look
+        // up node ids in edges). We assert by the trailing letter.
+        assert!(
+            hs[0].node.name.contains(":d:L"),
+            "first hotspot should be d (3 inbound); got {:?}",
+            hs.iter().map(|h| (&h.node.name, h.in_degree)).collect::<Vec<_>>()
+        );
+        assert_eq!(hs[0].in_degree, 3);
+        assert!(
+            hs[1].node.name.contains(":c:L"),
+            "second hotspot should be c (2 inbound); got {:?}",
+            hs.iter().map(|h| (&h.node.name, h.in_degree)).collect::<Vec<_>>()
+        );
+        assert_eq!(hs[1].in_degree, 2);
     }
 }

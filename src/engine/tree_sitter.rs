@@ -927,6 +927,13 @@ impl GraphProvider for TreeSitterEngine {
             impact,
         })
     }
+
+    async fn architecture_overview(
+        &self,
+        req: &ArchitectureRequest,
+    ) -> GraphResult<ArchitectureReport> {
+        self.storage.architecture_overview(req)
+    }
 }
 
 // =============================================================================
@@ -1324,5 +1331,37 @@ mod tests {
         assert_eq!(report.seeds.len(), 1);
         assert_eq!(report.seeds[0].file_path, "src/lib.rs");
         assert_eq!(report.seeds[0].nodes.len(), 2);
+    }
+
+    /// Architecture overview with the default aspect set returns the
+    /// standard sections populated. At minimum, `overview` must be
+    /// present and have at least the function + file nodes built from
+    /// the bootstrap source.
+    #[tokio::test]
+    async fn engine_architecture_overview_includes_default_aspects() {
+        let (_dir, _root, engine) = bootstrap(&[(
+            "src/lib.rs",
+            "pub fn used() -> i32 { 1 }\npub fn unused() -> i32 { 2 }\npub fn caller() -> i32 { used(); 3 }\n",
+        )])
+        .await;
+
+        let req = ArchitectureRequest::default();
+        let report = engine.architecture_overview(&req).await.unwrap();
+        let o = report.overview.expect("overview populated by default set");
+        assert!(
+            o.total_nodes >= 4,
+            "default overview should count at least 4 nodes (3 funcs + 1 file), got {}",
+            o.total_nodes
+        );
+        // Default set includes every standard aspect; at least one of
+        // entry_points / hotspots / languages must be populated given
+        // any of those data is present.
+        let any_populated = report.entry_points.is_some()
+            || report.hotspots.is_some()
+            || report.languages.is_some();
+        assert!(
+            any_populated,
+            "default set should populate at least one downstream aspect"
+        );
     }
 }

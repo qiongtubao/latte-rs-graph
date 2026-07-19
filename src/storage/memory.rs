@@ -341,6 +341,380 @@ impl MemoryStorage {
             .map_err(|e| GraphError::Engine(e.to_string()))?;
         Ok(nodes.values().filter(|n| is_entry_point(n)).count())
     }
+
+    // =========================================================================
+    // Architecture overview (Phase 4) — in-memory mirror
+    // =========================================================================
+    //
+    // Best-effort port of the SQLite aggregation: the in-memory maps are
+    // small enough that we can just bucket in Rust instead of SQL. The
+    // output shape is identical to the SQLite one so callers (CLI, JSON
+    // exporters) see the same report regardless of backend.
+
+    pub fn architecture_overview(
+        &self,
+        req: &ArchitectureRequest,
+    ) -> GraphResult<ArchitectureReport> {
+        let aspects = if req.aspects.is_empty() {
+            ArchitectureAspect::default_set()
+        } else {
+            req.aspects.clone()
+        };
+        let top_n = req.top_n.max(1);
+        let wants = |a: ArchitectureAspect| aspects.contains(&a);
+
+        let all_nodes = self.all_nodes()?;
+        let all_edges = self.all_edges()?;
+        let scoped_nodes: Vec<Node> = match &req.path_scope {
+            Some(scope) => all_nodes
+                .into_iter()
+                .filter(|n| n.file_path == *scope || n.file_path.starts_with(&format!("{scope}/")))
+                .collect(),
+            None => all_nodes,
+        };
+        let id_set: std::collections::HashSet<&str> =
+            scoped_nodes.iter().map(|n| n.id.as_str()).collect();
+        let scoped_edges: Vec<&Edge> = match &req.path_scope {
+            Some(scope) => all_edges
+                .iter()
+                .filter(|e| {
+                    let s = id_to_file(e.source.as_str(), &scoped_nodes);
+                    let t = id_to_file(e.target.as_str(), &scoped_nodes);
+                    s.map(|p| p == *scope || p.starts_with(&format!("{scope}/"))).unwrap_or(false)
+                        || t.map(|p| p == *scope || p.starts_with(&format!("{scope}/"))).unwrap_or(false)
+                })
+                .collect(),
+            None => all_edges.iter().collect(),
+        };
+
+        let mut report = ArchitectureReport {
+            requested_aspects: aspects.clone(),
+            path_scope: req.path_scope.clone(),
+            ..Default::default()
+        };
+
+        // ----- Overview ----------------------------------------------------
+        if wants(ArchitectureAspect::Overview) {
+            let total_edges = scoped_edges.len();
+            let total_files = scoped_nodes
+                .iter()
+                .map(|n| n.file_path.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let total_routes = scoped_nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Route)
+                .count();
+            let languages_count = scoped_nodes
+                .iter()
+                .map(|n| n.language.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let entry_points_count = scoped_nodes.iter().filter(|n| is_entry_point(n)).count();
+            // Dead count: callable kinds with zero inbound `calls` AND not
+            // an entry point — mirrors the SQLite subquery.
+            let called: std::collections::HashSet<&str> = scoped_edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .map(|e| e.target.as_str())
+                .collect();
+            let dead_count = scoped_nodes
+                .iter()
+                .filter(|n| {
+                    matches!(n.kind, NodeKind::Function | NodeKind::Method | NodeKind::Test)
+                        && !called.contains(n.id.as_str())
+                        && !is_entry_point(n)
+                })
+                .count();
+            let call_edges_count = scoped_edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .count();
+            report.overview = Some(OverviewSection {
+                total_nodes: scoped_nodes.len(),
+                total_edges,
+                total_files,
+                total_routes,
+                languages_count,
+                entry_points_count,
+                dead_count,
+                call_edges_count,
+            });
+        }
+
+        // Indexes that the per-aspect sections need.
+        let id_to_node: std::collections::HashMap<&str, &Node> =
+            scoped_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let _ = id_set;
+
+        // ----- Structure / Packages ---------------------------------------
+        if wants(ArchitectureAspect::Structure) || wants(ArchitectureAspect::Packages) {
+            let mut pkg_nodes: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for n in &scoped_nodes {
+                *pkg_nodes.entry(package_of(&n.file_path, 2)).or_default() += 1;
+            }
+            let mut pkg_edges: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for e in &scoped_edges {
+                if let (Some(s), Some(t)) = (id_to_node.get(e.source.as_str()), id_to_node.get(e.target.as_str())) {
+                    if s.file_path == t.file_path {
+                        continue;
+                    }
+                    let sp = package_of(&s.file_path, 2);
+                    let tp = package_of(&t.file_path, 2);
+                    if sp == tp {
+                        *pkg_edges.entry(sp).or_default() += 1;
+                    }
+                }
+            }
+            let mut rows: Vec<PackageRow> = pkg_nodes
+                .into_iter()
+                .map(|(path, node_count)| PackageRow {
+                    edge_count: *pkg_edges.get(&path).unwrap_or(&0),
+                    node_count,
+                    path,
+                })
+                .collect();
+            rows.sort_by(|a, b| b.node_count.cmp(&a.node_count).then(a.path.cmp(&b.path)));
+            if wants(ArchitectureAspect::Structure) {
+                report.structure = Some(rows.clone());
+            }
+            if wants(ArchitectureAspect::Packages) {
+                rows.truncate(top_n);
+                report.packages = Some(rows);
+            }
+        }
+
+        // ----- Dependencies -----------------------------------------------
+        if wants(ArchitectureAspect::Dependencies) {
+            let mut dep: std::collections::BTreeMap<(String, String), usize> =
+                std::collections::BTreeMap::new();
+            for e in scoped_edges.iter().filter(|e| e.kind == EdgeKind::Imports) {
+                if let (Some(s), Some(t)) = (id_to_node.get(e.source.as_str()), id_to_node.get(e.target.as_str())) {
+                    if s.file_path == t.file_path {
+                        continue;
+                    }
+                    *dep.entry((s.file_path.clone(), t.file_path.clone())).or_default() += 1;
+                }
+            }
+            let mut rows: Vec<DepRow> = dep
+                .into_iter()
+                .map(|((from_path, to_path), edge_count)| DepRow { from_path, to_path, edge_count })
+                .collect();
+            rows.sort_by(|a, b| b.edge_count.cmp(&a.edge_count));
+            rows.truncate(top_n);
+            report.dependencies = Some(rows);
+        }
+
+        // ----- Routes -----------------------------------------------------
+        if wants(ArchitectureAspect::Routes) {
+            let mut rows: Vec<RouteRow> = scoped_nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Route)
+                .map(|n| RouteRow {
+                    id: n.id.clone(),
+                    qualified_name: n.qualified_name.clone(),
+                    file_path: n.file_path.clone(),
+                    start_line: n.start_line,
+                    method: n.extra.get("method").cloned(),
+                    path: n.extra.get("path").cloned(),
+                })
+                .collect();
+            rows.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.start_line.cmp(&b.start_line)));
+            report.routes = Some(rows);
+        }
+
+        // ----- Languages --------------------------------------------------
+        if wants(ArchitectureAspect::Languages) {
+            let mut node_count: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            let mut files: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+                std::collections::BTreeMap::new();
+            for n in &scoped_nodes {
+                *node_count.entry(n.language.as_str()).or_default() += 1;
+                files.entry(n.language.as_str()).or_default().insert(n.file_path.as_str());
+            }
+            let mut edge_count: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for e in &scoped_edges {
+                if let Some(s) = id_to_node.get(e.source.as_str()) {
+                    *edge_count.entry(s.language.as_str()).or_default() += 1;
+                }
+            }
+            let rows: Vec<LanguageRow> = node_count
+                .into_iter()
+                .map(|(language, nc)| LanguageRow {
+                    file_count: files.get(language).map(|s| s.len()).unwrap_or(0),
+                    edge_count: *edge_count.get(language).unwrap_or(&0),
+                    language: language.to_string(),
+                    node_count: nc,
+                })
+                .collect();
+            report.languages = Some(rows);
+        }
+
+        // ----- Entry points -----------------------------------------------
+        if wants(ArchitectureAspect::EntryPoints) {
+            let mut entries: Vec<Node> = scoped_nodes
+                .iter()
+                .filter(|n| is_entry_point(n))
+                .cloned()
+                .collect();
+            entries.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.name.cmp(&b.name)));
+            entries.truncate(200);
+            report.entry_points = Some(entries);
+        }
+
+        // ----- Hotspots ---------------------------------------------------
+        if wants(ArchitectureAspect::Hotspots) {
+            let mut indeg: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for e in scoped_edges.iter().filter(|e| e.kind == EdgeKind::Calls) {
+                *indeg.entry(e.target.as_str()).or_default() += 1;
+            }
+            let mut rows: Vec<HotspotRow> = indeg
+                .into_iter()
+                .filter_map(|(id, deg)| id_to_node.get(id).map(|n| (n, deg)))
+                .map(|(n, in_degree)| HotspotRow { node: (*n).clone(), in_degree })
+                .collect();
+            rows.sort_by(|a, b| b.in_degree.cmp(&a.in_degree).then(a.node.qualified_name.cmp(&b.node.qualified_name)));
+            rows.truncate(top_n);
+            report.hotspots = Some(rows);
+        }
+
+        // ----- Boundaries -------------------------------------------------
+        if wants(ArchitectureAspect::Boundaries) {
+            let mut inbound: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut outbound: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for e in scoped_edges.iter().filter(|e| e.kind == EdgeKind::Calls) {
+                let (Some(s), Some(t)) =
+                    (id_to_node.get(e.source.as_str()), id_to_node.get(e.target.as_str())) else { continue; };
+                if s.file_path == t.file_path {
+                    continue;
+                }
+                let sp = package_of(&s.file_path, 2);
+                let tp = package_of(&t.file_path, 2);
+                if sp != tp {
+                    *outbound.entry(sp).or_default() += 1;
+                    *inbound.entry(tp).or_default() += 1;
+                }
+            }
+            let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            keys.extend(inbound.keys().cloned());
+            keys.extend(outbound.keys().cloned());
+            let mut rows: Vec<BoundaryRow> = keys
+                .into_iter()
+                .map(|path| {
+                    let ib = *inbound.get(&path).unwrap_or(&0);
+                    let ob = *outbound.get(&path).unwrap_or(&0);
+                    let total = (ib + ob) as f64;
+                    let ratio = if total > 0.0 { ob as f64 / total } else { 0.0 };
+                    BoundaryRow { path, inbound_count: ib, outbound_count: ob, fan_out_ratio: ratio }
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                let ta = a.inbound_count + a.outbound_count;
+                let tb = b.inbound_count + b.outbound_count;
+                tb.cmp(&ta).then(a.path.cmp(&b.path))
+            });
+            rows.truncate(top_n);
+            report.boundaries = Some(rows);
+        }
+
+        // ----- Layers (BFS over CALLS from entry points) ------------------
+        if wants(ArchitectureAspect::Layers) {
+            let entries: Vec<&Node> = scoped_nodes
+                .iter()
+                .filter(|n| is_entry_point(n))
+                .collect();
+            let entry_count = entries.len();
+            let mut layer: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for &seed in &entries {
+                layer.insert(seed.id.clone(), 0);
+            }
+            let mut adj: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for e in scoped_edges.iter().filter(|e| e.kind == EdgeKind::Calls) {
+                adj.entry(e.source.as_str()).or_default().push(e.target.as_str());
+            }
+            let mut frontier: Vec<&str> = entries.iter().map(|n| n.id.as_str()).collect();
+            let mut max_layer = 0u32;
+            let mut current_layer = 0u32;
+            while !frontier.is_empty() {
+                let mut next: Vec<&str> = Vec::new();
+                for &node in &frontier {
+                    if let Some(targets) = adj.get(node) {
+                        for &t in targets {
+                            if let Some(t_node) = id_to_node.get(t) {
+                                let entry = layer.entry(t_node.id.clone()).or_insert(current_layer + 1);
+                                if *entry < current_layer + 1 {
+                                    *entry = current_layer + 1;
+                                }
+                                next.push(t);
+                            }
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                current_layer += 1;
+                max_layer = current_layer;
+                frontier = next;
+            }
+            let mut per_layer: Vec<usize> = vec![0; (max_layer as usize) + 1];
+            for &l in layer.values() {
+                if (l as usize) < per_layer.len() {
+                    per_layer[l as usize] += 1;
+                }
+            }
+            report.layers = Some(LayersSection {
+                entry_count,
+                max_layer,
+                node_count_per_layer: per_layer,
+            });
+        }
+
+        // ----- File tree --------------------------------------------------
+        if wants(ArchitectureAspect::FileTree) {
+            let root = req.path_scope.clone().unwrap_or_default();
+            let entries = crate::storage::sqlite::build_file_tree(&scoped_nodes);
+            report.file_tree = Some(FileTree { root, entries });
+        }
+
+        Ok(report)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local helpers for architecture_overview
+// ---------------------------------------------------------------------------
+
+/// Look up a node's `file_path` by node id, walking the supplied slice.
+/// Returns `None` if the id is unknown (e.g. the edge points to a node
+/// outside the loaded scope).
+fn id_to_file<'a>(id: &str, nodes: &'a [Node]) -> Option<&'a str> {
+    nodes.iter().find(|n| n.id == id).map(|n| n.file_path.as_str())
+}
+
+/// Directory prefix of `file_path` up to `depth` segments. Mirrors the
+/// SQLite-side helper so both backends bucket identically.
+fn package_of(file_path: &str, depth: usize) -> String {
+    if file_path.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<&str> = file_path.split('/').collect();
+    if !parts.is_empty() {
+        parts.pop();
+    }
+    if depth < parts.len() {
+        parts.truncate(depth);
+    }
+    parts.join("/")
 }
 
 // ---------------------------------------------------------------------------

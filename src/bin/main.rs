@@ -8,7 +8,8 @@ use latte_rs_graph::error::GraphResult;
 use latte_rs_graph::storage::SqliteStorage;
 use latte_rs_graph::traits::GraphProvider;
 use latte_rs_graph::types::{
-    BuildOptions, ComplexityMetrics, SearchCodeMode, SearchCodeRequest,
+    ArchitectureAspect, ArchitectureRequest, BuildOptions, ComplexityMetrics,
+    SearchCodeMode, SearchCodeRequest,
 };
 
 #[derive(Parser)]
@@ -113,6 +114,24 @@ enum Command {
         /// Direction: inbound | outbound | both
         #[arg(short = 'D', long, default_value = "inbound")]
         direction: String,
+    },
+    /// Multi-aspect architecture overview of the indexed project (Phase 4).
+    Arch {
+        /// Path to the graph database
+        db: PathBuf,
+        /// Optional file_path prefix to scope the analysis (e.g. "src/foo")
+        #[arg(long)]
+        path: Option<String>,
+        /// Comma-separated aspects to include (e.g. "overview,structure,hotspots").
+        /// Empty = the default set (everything except clusters/cycles).
+        #[arg(long)]
+        aspects: Option<String>,
+        /// Top-N cap for hotspots / boundaries / dependencies.
+        #[arg(short = 'n', long, default_value = "20")]
+        top_n: usize,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -426,6 +445,28 @@ async fn main() -> GraphResult<()> {
                 );
             }
         }
+
+        Command::Arch { db, path, aspects, top_n, json } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+            let aspect_list = aspects
+                .as_deref()
+                .map(ArchitectureAspect::parse_list)
+                .unwrap_or_default();
+            let req = ArchitectureRequest {
+                path_scope: path,
+                aspects: aspect_list,
+                top_n,
+            };
+            let report = engine.architecture_overview(&req).await?;
+            if json {
+                let s = serde_json::to_string_pretty(&report)
+                    .map_err(latte_rs_graph::error::GraphError::Serde)?;
+                println!("{s}");
+            } else {
+                render_arch_report(&report);
+            }
+        }
      }
 
     Ok(())
@@ -514,5 +555,188 @@ fn parse_direction(s: &str) -> latte_rs_graph::types::BlastDirection {
         "outbound" => latte_rs_graph::types::BlastDirection::Outbound,
         "both" => latte_rs_graph::types::BlastDirection::Both,
         _ => latte_rs_graph::types::BlastDirection::Inbound,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Architecture report rendering (Phase 4)
+// ---------------------------------------------------------------------------
+//
+/// Pretty-print an architecture report to stdout. Sections appear in a fixed
+/// order; sections that weren't requested are skipped. Used when the user
+/// runs `lrg arch` without `--json`.
+fn render_arch_report(report: &latte_rs_graph::types::ArchitectureReport) {
+    use latte_rs_graph::types::ArchitectureAspect;
+
+    let wanted: std::collections::HashSet<ArchitectureAspect> =
+        report.requested_aspects.iter().copied().collect();
+
+    if wanted.contains(&ArchitectureAspect::Overview) {
+        if let Some(o) = &report.overview {
+            println!("📊 overview");
+            println!("   total_nodes        = {}", o.total_nodes);
+            println!("   total_edges        = {}", o.total_edges);
+            println!("   total_files        = {}", o.total_files);
+            println!("   total_routes       = {}", o.total_routes);
+            println!("   languages_count    = {}", o.languages_count);
+            println!("   entry_points_count = {}", o.entry_points_count);
+            println!("   dead_count         = {}", o.dead_count);
+            println!("   call_edges_count   = {}", o.call_edges_count);
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Structure) {
+        if let Some(rows) = &report.structure {
+            println!("📦 structure");
+            for r in rows {
+                println!("   {p}  {n} nodes  {e} edges",
+                    p = r.path,
+                    n = r.node_count,
+                    e = r.edge_count);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Packages) {
+        if let Some(rows) = &report.packages {
+            println!("📦 packages");
+            for r in rows {
+                println!("   {p}  {n} nodes  {e} edges",
+                    p = r.path,
+                    n = r.node_count,
+                    e = r.edge_count);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Dependencies) {
+        if let Some(rows) = &report.dependencies {
+            println!("🔗 dependencies");
+            for r in rows {
+                println!("   {from} -> {to}  {n} edges",
+                    from = r.from_path,
+                    to = r.to_path,
+                    n = r.edge_count);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Routes) {
+        if let Some(rows) = &report.routes {
+            println!("🛣  routes");
+            for r in rows {
+                let method_path = match (&r.method, &r.path) {
+                    (Some(m), Some(p)) => format!("{m} {p}"),
+                    (Some(m), None) => m.clone(),
+                    (None, Some(p)) => p.clone(),
+                    _ => String::new(),
+                };
+                if method_path.is_empty() {
+                    println!("   {f}:{l}  {qn}",
+                        f = r.file_path,
+                        l = r.start_line,
+                        qn = r.qualified_name);
+                } else {
+                    println!("   {f}:{l}  {qn}  {mp}",
+                        f = r.file_path,
+                        l = r.start_line,
+                        qn = r.qualified_name,
+                        mp = method_path);
+                }
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Languages) {
+        if let Some(rows) = &report.languages {
+            println!("🌐 languages");
+            for r in rows {
+                println!("   {lang}  nodes={n}  edges={e}  files={f}",
+                    lang = r.language,
+                    n = r.node_count,
+                    e = r.edge_count,
+                    f = r.file_count);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::EntryPoints) {
+        if let Some(rows) = &report.entry_points {
+            println!("🚪 entry_points");
+            for n in rows {
+                println!("   {f}:{l}  {k} {qn}",
+                    f = n.file_path,
+                    l = n.start_line,
+                    k = n.kind.as_str(),
+                    qn = n.qualified_name);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Hotspots) {
+        if let Some(rows) = &report.hotspots {
+            println!("🔥 hotspots");
+            for r in rows {
+                println!("   {qn}  in_degree={d}  {f}:{l}",
+                    qn = r.node.qualified_name,
+                    d = r.in_degree,
+                    f = r.node.file_path,
+                    l = r.node.start_line);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Boundaries) {
+        if let Some(rows) = &report.boundaries {
+            println!("🚧 boundaries");
+            for r in rows {
+                println!("   {p}  in={i}  out={o}  fan_ratio={ratio:.2}",
+                    p = r.path,
+                    i = r.inbound_count,
+                    o = r.outbound_count,
+                    ratio = r.fan_out_ratio);
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Layers) {
+        if let Some(l) = &report.layers {
+            println!("🪜 layers");
+            println!("   entries={e}  max_layer={m}",
+                e = l.entry_count,
+                m = l.max_layer);
+            for (i, c) in l.node_count_per_layer.iter().enumerate() {
+                println!("   layer {i}: {c}");
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::FileTree) {
+        if let Some(t) = &report.file_tree {
+            println!("🌳 file_tree (root = {})", t.root);
+            for entry in &t.entries {
+                println!("   {}", entry.name);
+                let last = entry.children.len();
+                for (i, child) in entry.children.iter().enumerate() {
+                    let branch = if i + 1 == last { "└──" } else { "├──" };
+                    println!("     {branch} {}", child.name);
+                }
+            }
+            println!();
+        }
+    }
+
+    if wanted.contains(&ArchitectureAspect::Clusters) || wanted.contains(&ArchitectureAspect::Cycles) {
+        println!("⚠ clusters/cycles not yet implemented (Phase 5)");
     }
 }

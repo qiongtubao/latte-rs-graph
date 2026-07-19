@@ -3,9 +3,9 @@ use std::path::Path;
 
 use crate::error::GraphResult;
 use crate::types::{
-    BlastDirection, BlastRadiusReport, BuildOptions, BuildReport, ComplexityMetrics, DeadCodeReport,
-    GraphData, GraphStats, Node, RelationResult, SearchCodeRequest, SearchCodeResponse,
-    SearchOptions, UpdateReport,
+    ArchitectureReport, ArchitectureRequest, BlastDirection, BlastRadiusReport,
+    BuildOptions, BuildReport, ComplexityMetrics, DeadCodeReport, GraphData, GraphStats, Node,
+    RelationResult, SearchCodeRequest, SearchCodeResponse, SearchOptions, UpdateReport,
 };
 
 /// Core trait that every graph engine must implement.
@@ -97,6 +97,15 @@ pub trait GraphProvider: Send + Sync {
 
     /// Clear all cached data for this engine.
     async fn clear(&self) -> GraphResult<()>;
+
+    /// Multi-aspect architecture query (Phase 4). Returns a structured
+    /// report covering whatever aspects were requested in `req` (empty
+    /// aspect list = the default set, which excludes the deferred
+    /// `Clusters`/`Cycles`). Path scoping is honoured by the storage layer.
+    async fn architecture_overview(
+        &self,
+        req: &ArchitectureRequest,
+    ) -> GraphResult<ArchitectureReport>;
 }
 
 /// Extension trait for engines that support community detection.

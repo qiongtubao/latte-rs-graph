@@ -645,3 +645,213 @@ mod tokenizer_tests {
         assert_eq!(tokenize_identifier("HTTP"), "http");
     }
 }
+
+// =============================================================================
+// Architecture overview (Phase 4)
+// =============================================================================
+//
+// A multi-aspect query that returns a structured report about the indexed
+// project — file/package rollups, language breakdown, hotspots, layering,
+// file tree, etc. Each requested aspect is filled in; aspects not requested
+// stay `None` so the report stays slim.
+
+/// Which aspects to include. Empty `aspects` ⇒ "all standard" (no
+/// clusters/cycles).
+#[derive(Debug, Clone)]
+pub struct ArchitectureRequest {
+    /// Optional `file_path` prefix to scope analysis (e.g. `"src/foo"`).
+    pub path_scope: Option<String>,
+    /// Aspects to compute. Empty = use `ArchitectureAspect::default_set()`.
+    pub aspects: Vec<ArchitectureAspect>,
+    /// Top-N cap for hotspots / boundaries / dependencies.
+    pub top_n: usize,
+}
+
+impl Default for ArchitectureRequest {
+    fn default() -> Self {
+        Self {
+            path_scope: None,
+            aspects: Vec::new(),
+            top_n: 20,
+        }
+    }
+}
+
+/// Each aspect is an independent query. `Clusters` and `Cycles` are
+/// placeholder variants for the Phase 5 plan — they parse cleanly but the
+/// storage layers skip them silently and the CLI prints a heads-up note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum ArchitectureAspect {
+    Overview,
+    Structure,
+    Dependencies,
+    Routes,
+    Languages,
+    Packages,
+    EntryPoints,
+    Hotspots,
+    Boundaries,
+    Layers,
+    FileTree,
+    /// Unsupported in v1 (needs Leiden / Phase 5).
+    Clusters,
+    /// Unsupported in v1 (needs SCC).
+    Cycles,
+}
+
+impl ArchitectureAspect {
+    /// Parse a comma-separated list of aspect names. Accepts kebab- or
+    /// snake-case. Unknown values are dropped silently so the CLI can take
+    /// free-form user input.
+    pub fn parse_list(s: &str) -> Vec<Self> {
+        s.split(',')
+            .map(|t| t.trim().to_ascii_lowercase().replace('-', "_"))
+            .filter_map(|t| match t.as_str() {
+                "overview" => Some(Self::Overview),
+                "structure" => Some(Self::Structure),
+                "dependencies" | "deps" => Some(Self::Dependencies),
+                "routes" => Some(Self::Routes),
+                "languages" | "langs" => Some(Self::Languages),
+                "packages" | "pkgs" => Some(Self::Packages),
+                "entry_points" => Some(Self::EntryPoints),
+                "hotspots" => Some(Self::Hotspots),
+                "boundaries" => Some(Self::Boundaries),
+                "layers" => Some(Self::Layers),
+                "file_tree" | "filetree" => Some(Self::FileTree),
+                "clusters" => Some(Self::Clusters),
+                "cycles" => Some(Self::Cycles),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The default set: everything except the deferred `Clusters`/`Cycles`.
+    pub fn default_set() -> Vec<Self> {
+        vec![
+            Self::Overview,
+            Self::Structure,
+            Self::Dependencies,
+            Self::Routes,
+            Self::Languages,
+            Self::Packages,
+            Self::EntryPoints,
+            Self::Hotspots,
+            Self::Boundaries,
+            Self::Layers,
+            Self::FileTree,
+        ]
+    }
+}
+
+/// All aspect data assembled for one query. Each field that wasn't
+/// requested stays `None` so the report stays slim and JSON shape stays
+/// predictable across runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArchitectureReport {
+    pub overview: Option<OverviewSection>,
+    pub structure: Option<Vec<PackageRow>>,
+    pub dependencies: Option<Vec<DepRow>>,
+    pub routes: Option<Vec<RouteRow>>,
+    pub languages: Option<Vec<LanguageRow>>,
+    pub packages: Option<Vec<PackageRow>>,
+    pub entry_points: Option<Vec<Node>>,
+    pub hotspots: Option<Vec<HotspotRow>>,
+    pub boundaries: Option<Vec<BoundaryRow>>,
+    pub layers: Option<LayersSection>,
+    pub file_tree: Option<FileTree>,
+    pub requested_aspects: Vec<ArchitectureAspect>,
+    pub path_scope: Option<String>,
+}
+
+/// Headline counts rolled up across the whole graph (or the path scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverviewSection {
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub total_files: usize,
+    pub total_routes: usize,
+    pub languages_count: usize,
+    pub entry_points_count: usize,
+    pub dead_count: usize,
+    pub call_edges_count: usize,
+}
+
+/// One row of the `Structure`/`Packages` rollup — a directory prefix
+/// (depth-2 by default) and the node count observed under it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageRow {
+    pub path: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+}
+
+/// One row of the `Dependencies` rollup — outgoing imports between two
+/// distinct files, grouped by (from_path, to_path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepRow {
+    pub from_path: String,
+    pub to_path: String,
+    pub edge_count: usize,
+}
+
+/// One row of the `Routes` aspect. `method`/`path` are pulled from
+/// `node.extra` when the parser populated them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteRow {
+    pub id: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub method: Option<String>,
+    pub path: Option<String>,
+}
+
+/// One row of the `Languages` aspect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageRow {
+    pub language: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub file_count: usize,
+}
+
+/// One row of the `Hotspots` aspect — a node and its inbound CALLS degree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotspotRow {
+    pub node: Node,
+    pub in_degree: usize,
+}
+
+/// One row of the `Boundaries` aspect — a directory with high fan-in and
+/// fan-out across package boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundaryRow {
+    pub path: String,
+    pub inbound_count: usize,
+    pub outbound_count: usize,
+    pub fan_out_ratio: f64,
+}
+
+/// `Layers` aspect result — a BFS layering from entry points along CALLS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayersSection {
+    pub entry_count: usize,
+    pub max_layer: u32,
+    pub node_count_per_layer: Vec<usize>,
+}
+
+/// `FileTree` aspect — a nested directory tree from distinct file paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTree {
+    pub root: String,
+    pub entries: Vec<FileTreeEntry>,
+}
+
+/// A single node in the file tree (either a directory or a leaf file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTreeEntry {
+    pub name: String,
+    pub kind: String,
+    pub children: Vec<FileTreeEntry>,
+}
