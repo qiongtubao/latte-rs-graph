@@ -491,3 +491,157 @@ pub struct BlastRadiusReport {
     pub seeds: Vec<BlastSeed>,
     pub impact: BlastImpact,
 }
+
+// =============================================================================
+// FTS5 identifier tokenizer (Phase 3)
+// =============================================================================
+
+/// Tokenize an identifier into space-separated lowercase tokens.
+///
+/// Examples:
+///   "updateCloudClient" -> "update cloud client"
+///   "parse_user_input" -> "parse user input"
+///   "XMLParser_next" -> "xmlparser next"
+///   "_leading_underscore" -> "leading underscore"
+///   "HTTPRequest" -> "httprequest"
+///   "HTTP" -> "http"
+///   "URL2Path" -> "url2 path"
+///   "" -> ""
+///   "___" -> ""
+///
+/// Algorithm:
+///   1. Strip leading `_` chars (silently — they don't become a token).
+///   2. Walk char by char. Lowercase / digit always append to the current
+///      token. Uppercase starts a NEW token UNLESS the current token ends
+///      in an uppercase char (i.e. we're in the middle of an all-caps run,
+///      or at the very start). When the current token ends in a lowercase
+///      or digit and we see an uppercase, we split. The new uppercase is
+///      lowercased if the next char is lowercase (camelCase merge at the
+///      upper-before-lower boundary).
+///   3. Underscores split tokens.
+///   4. Lowercase the joined result.
+///   5. Drop empty pieces and adjacent duplicates.
+///   6. Join with a single space.
+pub fn tokenize_identifier(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    // 1. Drop leading underscores silently.
+    let trimmed = input.trim_start_matches('_');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c == '_' {
+            // Underscore splits the current token.
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if c.is_ascii_uppercase() {
+            // Break only when the current token ends in lowercase or digit
+            // (i.e. we just finished a lowercase/digit run).
+            let prev_is_lower_or_digit = current
+                .chars()
+                .last()
+                .map(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                .unwrap_or(false);
+            if prev_is_lower_or_digit {
+                tokens.push(std::mem::take(&mut current));
+            }
+            // CamelCase merge: if next char is lowercase, lowercase this
+            // uppercase too so it joins the new lowercase word.
+            let next_is_lower = i + 1 < chars.len() && chars[i + 1].is_ascii_lowercase();
+            if next_is_lower {
+                current.push(c.to_ascii_lowercase());
+            } else {
+                current.push(c);
+            }
+        } else {
+            // Lowercase or digit: append to current.
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    // 4. Lowercase the joined result (so "X" -> "x", "HTTP" -> "http").
+    let lowered = tokens.join(" ").to_ascii_lowercase();
+
+    // 5. Drop empty pieces and adjacent duplicates.
+    let mut prev_emit: Option<&str> = None;
+    let mut out_pieces: Vec<&str> = Vec::new();
+    for piece in lowered.split_whitespace() {
+        if Some(piece) != prev_emit {
+            out_pieces.push(piece);
+            prev_emit = Some(piece);
+        }
+    }
+    out_pieces.join(" ")
+}
+
+/// Convenience: tokenize multiple fields joined by a separator, returning a
+/// single contiguous token stream suitable for an FTS5 `body` column.
+/// Empty pieces (from blank fields or pure-underscore inputs) are skipped.
+pub fn tokenize_for_fts(parts: &[&str]) -> String {
+    let mut body = String::new();
+    let mut first = true;
+    for part in parts {
+        let tokens = tokenize_identifier(part);
+        if tokens.is_empty() {
+            continue;
+        }
+        if !first {
+            body.push(' ');
+        }
+        body.push_str(&tokens);
+        first = false;
+    }
+    body
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn camel() {
+        assert_eq!(tokenize_identifier("updateCloudClient"), "update cloud client");
+    }
+
+    #[test]
+    fn snake() {
+        assert_eq!(tokenize_identifier("parse_user_input"), "parse user input");
+    }
+
+    #[test]
+    fn mixed() {
+        assert_eq!(tokenize_identifier("XMLParser_next"), "xmlparser next");
+    }
+
+    #[test]
+    fn empty() {
+        assert_eq!(tokenize_identifier(""), "");
+    }
+
+    #[test]
+    fn underscore_only() {
+        assert_eq!(tokenize_identifier("___"), "");
+    }
+
+    #[test]
+    fn digits() {
+        assert_eq!(tokenize_identifier("foo123Bar"), "foo123 bar");
+    }
+
+    #[test]
+    fn all_caps() {
+        assert_eq!(tokenize_identifier("HTTP"), "http");
+    }
+}

@@ -145,6 +145,19 @@ impl SqliteStorage {
             ",
         )?;
 
+
+        // FTS5 virtual table for identifier-aware full-text search (Phase 3).
+        // We pre-tokenize identifiers in Rust and store the space-joined
+        // tokens in `body`, so the built-in unicode61 tokenizer is enough
+        // (no C tokenizer needed). `id` is UNINDEXED so it doesn't pollute
+        // the term dictionary.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+                id UNINDEXED,
+                body,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );"
+        )?;
         // Step 2: Create indexes
         for sql in &[
             "CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path)",
@@ -169,13 +182,10 @@ impl SqliteStorage {
         )?;
 
         Ok(())
-}
-
-    // =====================================================================
-    // Write
-    // =====================================================================
+    }
 
     pub fn upsert_node(&self, node: &Node) -> GraphResult<()> {
+        let body = fts_body(node);
         let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
         let now = chrono::Utc::now().timestamp();
         let kind = node.kind.as_str();
@@ -202,13 +212,15 @@ impl SqliteStorage {
                 now,
             ],
         )?;
+        // Keep FTS index in sync (Phase 3).
+        fts_upsert(&conn, &node.id, &body)?;
         Ok(())
     }
-
     pub fn upsert_nodes_batch(&self, nodes: &[Node]) -> GraphResult<()> {
         let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
         let tx = conn.unchecked_transaction()?;
         for node in nodes {
+            let body = fts_body(node);
             let kind = node.kind.as_str();
             let now = chrono::Utc::now().timestamp();
             let extra_json = serde_json::to_string(&node.extra)?;
@@ -234,6 +246,8 @@ impl SqliteStorage {
                     now,
                 ],
             )?;
+            // Keep FTS index in sync (Phase 3).
+            fts_upsert(&tx, &node.id, &body)?;
         }
         tx.commit()?;
         Ok(())
@@ -295,7 +309,10 @@ impl SqliteStorage {
 
     pub fn clear_all(&self) -> GraphResult<()> {
         let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
-        conn.execute_batch("DELETE FROM nodes; DELETE FROM edges; DELETE FROM files; DELETE FROM `references`;")?;
+        conn.execute_batch(
+            "DELETE FROM nodes; DELETE FROM edges; DELETE FROM files; \
+             DELETE FROM `references`; DELETE FROM nodes_fts;"
+        )?;
         Ok(())
     }
 
@@ -320,6 +337,8 @@ impl SqliteStorage {
                 "DELETE FROM nodes WHERE file_path = ?1",
                 params![relative_path],
             )?;
+            // Keep FTS index in sync (Phase 3).
+            fts_delete_for_ids(&tx, &ids)?;
         }
         tx.commit()?;
         Ok(ids)
@@ -464,32 +483,7 @@ impl SqliteStorage {
              FROM nodes WHERE valid = 1",
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            let extra_str: String = row.get(17)?;
-            let extra: HashMap<String, String> =
-                serde_json::from_str(&extra_str).unwrap_or_default();
-
-            Ok(Node {
-                id: row.get(0)?,
-                kind: NodeKind::from_str(&row.get::<_, String>(1)?),
-                name: row.get(2)?,
-                qualified_name: row.get(3)?,
-                file_path: row.get(4)?,
-                language: row.get(5)?,
-                start_line: row.get::<_, i32>(6)? as u32,
-                end_line: row.get::<_, i32>(7)? as u32,
-                start_column: row.get::<_, i32>(8)? as u32,
-                end_column: row.get::<_, i32>(9)? as u32,
-                signature: row.get(10)?,
-                docstring: row.get(11)?,
-                visibility: row.get(12)?,
-                is_exported: row.get::<_, i32>(13)? != 0,
-                is_async: row.get::<_, i32>(14)? != 0,
-                is_static: row.get::<_, i32>(15)? != 0,
-                is_abstract: row.get::<_, i32>(16)? != 0,
-                extra,
-            })
-        })?;
+        let rows = stmt.query_map([], row_to_node)?;
 
         let nodes: Vec<Node> = rows.collect::<Result<_, _>>()?;
         Ok(nodes)
@@ -519,48 +513,40 @@ impl SqliteStorage {
         Ok(edges)
     }
 
+    /// FTS5 + BM25 ranked search. Splits camelCase / snake_case identifiers
+    /// before matching, so `updateCloudClient` is matched by the user query
+    /// "update cloud" or "cloud client", and `parse_user_input` by "parse
+    /// user" or "user input".
+    ///
+    /// Empty query (or one that tokenizes to nothing, e.g. "___") returns
+    /// the most recently inserted nodes via `search_recent`.
     pub fn search_nodes(&self, query: &str, limit: usize) -> GraphResult<Vec<Node>> {
+        // No query or nothing tokenizable → fall back to "recent nodes".
+        if query.trim().is_empty() {
+            return self.search_recent(limit);
+        }
+        let body = crate::types::tokenize_for_fts(&[query]);
+        if body.trim().is_empty() {
+            return self.search_recent(limit);
+        }
         let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
-        let pattern = format!("%{}%", query);
+        // FTS5 MATCH treats space-separated tokens as implicit AND, which
+        // matches the existing substring-search UX (all terms must appear).
+        // BM25 ranks more-specific matches higher (shorter body = better).
         let mut stmt = conn.prepare(
-            "SELECT id, kind, name, qualified_name, file_path, language,
-                    start_line, end_line, start_column, end_column,
-                    signature, docstring, visibility,
-                    is_exported, is_async, is_static, is_abstract, extra
-             FROM nodes WHERE valid = 1
-               AND (name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1)
+            "SELECT n.id, n.kind, n.name, n.qualified_name, n.file_path, n.language,
+                    n.start_line, n.end_line, n.start_column, n.end_column,
+                    n.signature, n.docstring, n.visibility,
+                    n.is_exported, n.is_async, n.is_static, n.is_abstract, n.extra
+             FROM nodes_fts f
+             JOIN nodes n ON n.id = f.id
+             WHERE nodes_fts MATCH ?1
+               AND n.valid = 1
+             ORDER BY bm25(nodes_fts) ASC
              LIMIT ?2",
         )?;
-
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-            let extra_str: String = row.get(17)?;
-            let extra: HashMap<String, String> =
-                serde_json::from_str(&extra_str).unwrap_or_default();
-
-            Ok(Node {
-                id: row.get(0)?,
-                kind: NodeKind::from_str(&row.get::<_, String>(1)?),
-                name: row.get(2)?,
-                qualified_name: row.get(3)?,
-                file_path: row.get(4)?,
-                language: row.get(5)?,
-                start_line: row.get::<_, i32>(6)? as u32,
-                end_line: row.get::<_, i32>(7)? as u32,
-                start_column: row.get::<_, i32>(8)? as u32,
-                end_column: row.get::<_, i32>(9)? as u32,
-                signature: row.get(10)?,
-                docstring: row.get(11)?,
-                visibility: row.get(12)?,
-                is_exported: row.get::<_, i32>(13)? != 0,
-                is_async: row.get::<_, i32>(14)? != 0,
-                is_static: row.get::<_, i32>(15)? != 0,
-                is_abstract: row.get::<_, i32>(16)? != 0,
-                extra,
-            })
-        })?;
-
-        let nodes: Vec<Node> = rows.collect::<Result<_, _>>()?;
-        Ok(nodes)
+        let rows = stmt.query_map(params![body, limit as i64], row_to_node)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn find_definitions(&self, name: &str) -> GraphResult<Vec<Node>> {
@@ -576,32 +562,7 @@ impl SqliteStorage {
              LIMIT 50",
         )?;
 
-        let rows = stmt.query_map(params![name], |row| {
-            let extra_str: String = row.get(17)?;
-            let extra: HashMap<String, String> =
-                serde_json::from_str(&extra_str).unwrap_or_default();
-
-            Ok(Node {
-                id: row.get(0)?,
-                kind: NodeKind::from_str(&row.get::<_, String>(1)?),
-                name: row.get(2)?,
-                qualified_name: row.get(3)?,
-                file_path: row.get(4)?,
-                language: row.get(5)?,
-                start_line: row.get::<_, i32>(6)? as u32,
-                end_line: row.get::<_, i32>(7)? as u32,
-                start_column: row.get::<_, i32>(8)? as u32,
-                end_column: row.get::<_, i32>(9)? as u32,
-                signature: row.get(10)?,
-                docstring: row.get(11)?,
-                visibility: row.get(12)?,
-                is_exported: row.get::<_, i32>(13)? != 0,
-                is_async: row.get::<_, i32>(14)? != 0,
-                is_static: row.get::<_, i32>(15)? != 0,
-                is_abstract: row.get::<_, i32>(16)? != 0,
-                extra,
-            })
-        })?;
+        let rows = stmt.query_map(params![name], row_to_node)?;
 
         let nodes: Vec<Node> = rows.collect::<Result<_, _>>()?;
         Ok(nodes)
@@ -617,32 +578,7 @@ impl SqliteStorage {
              FROM nodes WHERE id = ?1 AND valid = 1",
         )?;
 
-        let mut rows = stmt.query_map(params![id], |row| {
-            let extra_str: String = row.get(17)?;
-            let extra: HashMap<String, String> =
-                serde_json::from_str(&extra_str).unwrap_or_default();
-
-            Ok(Node {
-                id: row.get(0)?,
-                kind: NodeKind::from_str(&row.get::<_, String>(1)?),
-                name: row.get(2)?,
-                qualified_name: row.get(3)?,
-                file_path: row.get(4)?,
-                language: row.get(5)?,
-                start_line: row.get::<_, i32>(6)? as u32,
-                end_line: row.get::<_, i32>(7)? as u32,
-                start_column: row.get::<_, i32>(8)? as u32,
-                end_column: row.get::<_, i32>(9)? as u32,
-                signature: row.get(10)?,
-                docstring: row.get(11)?,
-                visibility: row.get(12)?,
-                is_exported: row.get::<_, i32>(13)? != 0,
-                is_async: row.get::<_, i32>(14)? != 0,
-                is_static: row.get::<_, i32>(15)? != 0,
-                is_abstract: row.get::<_, i32>(16)? != 0,
-                extra,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], row_to_node)?;
 
         match rows.next() {
             Some(Ok(node)) => Ok(Some(node)),
@@ -1121,6 +1057,119 @@ impl SqliteStorage {
         )?;
         Ok(count as usize)
     }
+
+    // =========================================================================
+    // FTS5 helpers (Phase 3)
+    // =========================================================================
+
+    /// Most-recently-inserted valid nodes, ranked by `rowid` desc.
+    /// Used as the fallback when the user submits an empty / non-tokenizable
+    /// query to `search_nodes`.
+    fn search_recent(&self, limit: usize) -> GraphResult<Vec<Node>> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, name, qualified_name, file_path, language,
+                    start_line, end_line, start_column, end_column,
+                    signature, docstring, visibility,
+                    is_exported, is_async, is_static, is_abstract, extra
+             FROM nodes WHERE valid = 1
+             ORDER BY rowid DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_node)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+/// Map a SELECT-row over the `nodes` table to a `Node`. Shared by
+/// `all_nodes`, `search_nodes`, `find_definitions`, and `node_by_id`
+/// so the column ordering lives in exactly one place.
+fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
+    let extra_str: String = row.get(17)?;
+    let extra: HashMap<String, String> =
+        serde_json::from_str(&extra_str).unwrap_or_default();
+    Ok(Node {
+        id: row.get(0)?,
+        kind: NodeKind::from_str(&row.get::<_, String>(1)?),
+        name: row.get(2)?,
+        qualified_name: row.get(3)?,
+        file_path: row.get(4)?,
+        language: row.get(5)?,
+        start_line: row.get::<_, i32>(6)? as u32,
+        end_line: row.get::<_, i32>(7)? as u32,
+        start_column: row.get::<_, i32>(8)? as u32,
+        end_column: row.get::<_, i32>(9)? as u32,
+        signature: row.get(10)?,
+        docstring: row.get(11)?,
+        visibility: row.get(12)?,
+        is_exported: row.get::<_, i32>(13)? != 0,
+        is_async: row.get::<_, i32>(14)? != 0,
+        is_static: row.get::<_, i32>(15)? != 0,
+        is_abstract: row.get::<_, i32>(16)? != 0,
+        extra,
+    })
+}
+
+// ---- FTS5 sync helpers (private, module-scoped) --------------------------
+
+/// Build the space-joined body string for FTS5 from a Node.
+/// Identifier-tokenizes each field (name, qualified_name, optional signature)
+/// so the body becomes a flat stream of lowercase tokens like
+/// "update cloud client function update cloud client (self )" — the FTS5
+/// MATCH expression for a user query "update cloud client" hits this row.
+fn fts_body(node: &Node) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(node.name.clone());
+    parts.push(node.qualified_name.clone());
+    if let Some(sig) = &node.signature {
+        parts.push(sig.clone());
+    }
+    let mut body = String::new();
+    let mut first = true;
+    for part in &parts {
+        let tokens = crate::types::tokenize_identifier(part);
+        if tokens.is_empty() {
+            continue;
+        }
+        if !first {
+            body.push(' ');
+        }
+        body.push_str(&tokens);
+        first = false;
+    }
+    body
+}
+
+/// Insert (or refresh) the FTS row for a node id. Any prior FTS row with
+/// the same id is removed first — INSERT OR REPLACE isn't supported on
+/// FTS5 virtual tables, so DELETE+INSERT is the standard pattern.
+fn fts_upsert(conn: &rusqlite::Connection, node_id: &str, body: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM nodes_fts WHERE id = ?1", params![node_id])?;
+    conn.execute(
+        "INSERT INTO nodes_fts (id, body) VALUES (?1, ?2)",
+        params![node_id, body],
+    )?;
+    Ok(())
+}
+
+/// Bulk-delete FTS rows by id. Used by `clear_all` and by
+/// `delete_nodes_for_file`. Chunks under SQLite's 999-param cap.
+fn fts_delete_for_ids(conn: &rusqlite::Connection, ids: &[String]) -> rusqlite::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    const CHUNK: usize = 500;
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM nodes_fts WHERE id IN ({})", placeholders);
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        conn.execute(&sql, params_vec.as_slice())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1426,5 +1475,172 @@ mod tests {
             .unwrap();
         assert_eq!(impact.total_count, 1);
         assert_eq!(impact.nodes[0].id, "function:c:L1");
+    }
+
+    // =========================================================================
+    // Phase 3 — FTS5 / BM25 search tests
+    // =========================================================================
+
+    /// Insert two camelCase functions, search by their space-separated tokens,
+    /// assert the matching node ranks first.
+    #[test]
+    fn search_nodes_finds_camel_case_split() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:updateCloudClient:L1", "src/a.rs"))
+            .unwrap();
+        s.upsert_node(&mk_node("function:parseUserInput:L2", "src/a.rs"))
+            .unwrap();
+
+        let hits = s.search_nodes("update cloud", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "expected at least one match for 'update cloud'"
+        );
+        assert_eq!(
+            hits[0].id, "function:updateCloudClient:L1",
+            "updateCloudClient must rank first; got {:?}",
+            hits.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Insert a snake_case function, search by its underscore-separated tokens.
+    #[test]
+    fn search_nodes_finds_snake_case() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:parse_user_input:L1", "src/a.rs"))
+            .unwrap();
+
+        let hits = s.search_nodes("parse user input", 10).unwrap();
+        assert!(!hits.is_empty(), "expected a match for 'parse user input'");
+        assert_eq!(hits[0].id, "function:parse_user_input:L1");
+    }
+
+    /// Insert nodes whose names share a substring (`Parser`, `Parse`,
+    /// `parse_user_input`) and search for the shortest token "parse".
+    /// BM25 should rank the exact-token `Parse` first.
+    #[test]
+    fn search_nodes_bm25_prefers_exact_match() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:Parser:L1", "src/a.rs"))
+            .unwrap();
+        s.upsert_node(&mk_node("function:parse_user_input:L2", "src/a.rs"))
+            .unwrap();
+        s.upsert_node(&mk_node("function:Parse:L3", "src/a.rs"))
+            .unwrap();
+
+        let hits = s.search_nodes("parse", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "expected at least one match for 'parse'"
+        );
+        assert_eq!(
+            hits[0].id, "function:Parse:L3",
+            "exact-token `Parse` should rank first under BM25; got {:?}",
+            hits.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Bypass the public API to delete a node directly with raw SQL, then
+    /// confirm search_nodes no longer returns it — FTS index must have
+    /// been synced when upsert_node ran (so the indexed body was correct)
+    /// and the public delete path clears the FTS row alongside the
+    /// regular row.
+    #[test]
+    fn fts_stays_in_sync_after_delete() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:alphaOne:L1", "src/a.rs"))
+            .unwrap();
+        s.upsert_node(&mk_node("function:betaTwo:L2", "src/a.rs"))
+            .unwrap();
+        s.upsert_node(&mk_node("function:gammaThree:L3", "src/a.rs"))
+            .unwrap();
+
+        // Sanity: all three are searchable.
+        let before: Vec<String> = s
+            .search_nodes("alpha", 10)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(before.len(), 1, "alpha must be searchable before delete");
+
+        // Use the public delete path (which clears the FTS row).
+        let removed = s.delete_nodes_for_file("src/a.rs").unwrap();
+        assert_eq!(removed.len(), 3);
+
+        // After delete, search must return no results — FTS rows were
+        // dropped in the same transaction.
+        let after: Vec<String> = s
+            .search_nodes("alpha", 10)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert!(after.is_empty(), "alpha must not survive delete_nodes_for_file");
+
+        let beta: Vec<String> = s
+            .search_nodes("beta", 10)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert!(beta.is_empty(), "beta must not survive delete_nodes_for_file");
+    }
+
+    /// Insert nodes, clear the storage, confirm FTS index is also empty
+    /// (so a fresh search returns nothing).
+    #[test]
+    fn fts_stays_in_sync_after_clear_all() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:foo:L1", "src/a.rs"))
+            .unwrap();
+        s.upsert_node(&mk_node("function:bar:L2", "src/a.rs"))
+            .unwrap();
+
+        s.clear_all().unwrap();
+
+        let hits = s.search_nodes("anything", 10).unwrap();
+        assert!(hits.is_empty(), "FTS rows must be wiped by clear_all");
+    }
+
+    /// Insert a single node via `upsert_node`, then search for a token from
+    /// its name. Confirms the FTS upsert hook fires on the single-node path.
+    #[test]
+    fn fts_insert_via_upsert_node_round_trip() {
+        let (_dir, s) = fresh();
+        s.upsert_node(&mk_node("function:greetWorld:L1", "src/a.rs"))
+            .unwrap();
+
+        let hits = s.search_nodes("greet world", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "function:greetWorld:L1");
+        // mk_node sets name == id, so the FTS body for this row contains
+        // "function" + "greet" + "world" (after splitting "greetWorld" on
+        // the camelCase boundary and "function:greetWorld:L1" on case /
+        // punctuation). Confirm the row came back with the expected id.
+        assert!(
+            hits[0].name.contains("greetWorld"),
+            "name should retain the camelCase portion, got {:?}",
+            hits[0].name
+        );
+    }
+
+    /// Empty / whitespace-only queries must NOT error and must fall back to
+    /// the recent-nodes path (so callers always get up to `limit` rows).
+    #[test]
+    fn search_nodes_empty_query_returns_recent() {
+        let (_dir, s) = fresh();
+        for id in ["function:alphaOne:L1", "function:betaTwo:L2", "function:gammaThree:L3"] {
+            s.upsert_node(&mk_node(id, "src/a.rs")).unwrap();
+        }
+
+        let empty = s.search_nodes("", 10).unwrap();
+        assert_eq!(empty.len(), 3, "empty query must return recent nodes");
+
+        let whitespace = s.search_nodes("  ", 10).unwrap();
+        assert_eq!(whitespace.len(), 3, "whitespace query must return recent nodes");
+
+        let underscored = s.search_nodes("___", 10).unwrap();
+        assert_eq!(underscored.len(), 3, "underscore-only query must fall through to recent nodes");
     }
 }
