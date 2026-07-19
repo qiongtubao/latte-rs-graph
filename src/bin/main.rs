@@ -133,6 +133,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Find the top-N most semantically similar functions to the given
+    /// function (algorithmic, 11-signal cosine blend; see Phase 9).
+    SemSimilar {
+        /// Path to the graph database
+        db: PathBuf,
+        /// Function/method name to seed the search
+        function: String,
+        /// Top-N results to return
+        #[arg(short = 'n', long, default_value = "5")]
+        top_n: usize,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Execute a Cypher query against the graph and print the result
     /// as JSON rows (Phase 5 subset).
     Cypher {
@@ -475,6 +489,13 @@ async fn main() -> GraphResult<()> {
                 render_arch_report(&report);
             }
         }
+        Command::SemSimilar { db, function, top_n, json } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+            let seeds = engine.find_definitions(&function).await?;
+            let all_callables = engine.graph_data().await?;
+            run_sem_similar(&seeds, &all_callables, &function, top_n, json)?;
+        }
         Command::Cypher { db, query } => {
             let storage = SqliteStorage::open_readonly(&db)?;
             let engine = TreeSitterEngine::new(storage);
@@ -754,4 +775,153 @@ fn render_arch_report(report: &latte_rs_graph::types::ArchitectureReport) {
     if wanted.contains(&ArchitectureAspect::Clusters) || wanted.contains(&ArchitectureAspect::Cycles) {
         println!("⚠ clusters/cycles not yet implemented (Phase 5)");
     }
+}
+
+// =============================================================================
+// lrg sem-similar — Phase 9 CLI
+// =============================================================================
+
+/// Emit the top-N most-similar callables to the first match in `seeds`,
+/// ranked by cosine similarity over the per-node embedding stored in
+/// `node.extra` during `build()`. Pure read-side: no DB writes, no
+/// reindex, no project-root open.
+fn run_sem_similar(
+    seeds: &[latte_rs_graph::types::Node],
+    callables: &latte_rs_graph::types::GraphData,
+    name: &str,
+    top_n: usize,
+    json: bool,
+) -> latte_rs_graph::error::GraphResult<()> {
+    if seeds.is_empty() {
+        println!("⚠ no definition found for \"{name}\".");
+        return Ok(());
+    }
+    if seeds.len() > 1 {
+        println!(
+            "ℹ {} matches; using the first ({} @ {})",
+            seeds.len(),
+            seeds[0].qualified_name,
+            seeds[0].file_path,
+        );
+    }
+    let target = &seeds[0];
+    let Some(target_embedding) = parse_semantic_embedding(&target.extra) else {
+        println!(
+            "⚠ \"{name}\" has no stored embedding — was this graph built before Phase 9?\n\
+             Re-run `lrg build` to populate semantic extras."
+        );
+        return Ok(());
+    };
+
+    let mut scored: Vec<(f32, &latte_rs_graph::types::Node)> = Vec::new();
+    for n in &callables.nodes {
+        if n.id == target.id {
+            continue;
+        }
+        if !is_callable(&n.kind) {
+            continue;
+        }
+        if let Some(embedding) = parse_semantic_embedding(&n.extra) {
+            let score = cosine_similarity(&target_embedding, &embedding);
+            if score > 0.0 {
+                scored.push((score, n));
+            }
+        }
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let top: Vec<(f32, &latte_rs_graph::types::Node)> = scored.into_iter().take(top_n).collect();
+
+    if json {
+        let value = serde_json::json!({
+            "seed": {
+                "id": target.id,
+                "qualified_name": target.qualified_name,
+                "file_path": target.file_path,
+            },
+            "results": top.iter().map(|(score, n)| serde_json::json!({
+                "score": score,
+                "id": n.id,
+                "qualified_name": n.qualified_name,
+                "file_path": n.file_path,
+                "kind": n.kind.as_str(),
+                "start_line": n.start_line,
+                "end_line": n.end_line,
+            })).collect::<Vec<_>>(),
+        });
+        let s = serde_json::to_string_pretty(&value)
+            .map_err(latte_rs_graph::error::GraphError::Serde)?;
+        println!("{s}");
+        return Ok(());
+    }
+
+    println!(
+        "🔮 most-similar to {} ({})",
+        target.qualified_name, target.file_path
+    );
+    if top.is_empty() {
+        println!("   (no callable siblings found — was this a trivial function?)");
+    }
+    for (i, (score, n)) in top.iter().enumerate() {
+        println!(
+            "   {}. [{:.3}] {} {} ({}:{})",
+            i + 1,
+            score,
+            n.kind.as_str(),
+            n.qualified_name,
+            n.file_path,
+            n.start_line,
+        );
+    }
+    Ok(())
+}
+
+/// Parse the per-node embedding stored in `node.extra` under the
+/// `semantic.embedding` key. `Node.extra` is a `HashMap<String, String>`,
+/// so the embedding is serialized as a space-separated list of floats.
+fn parse_semantic_embedding(
+    extra: &std::collections::HashMap<String, String>,
+) -> Option<Vec<f32>> {
+    let raw = extra.get("semantic.embedding")?;
+    let mut out = Vec::with_capacity(768);
+    for tok in raw.split_whitespace() {
+        let t = tok.trim_matches('"');
+        if let Ok(f) = t.parse::<f32>() {
+            out.push(f);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Cosine similarity over the dim lengths of `a` and `b`. Returns 0.0
+/// when either vector has zero magnitude.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for i in 0..n {
+        let x = a[i] as f64;
+        let y = b[i] as f64;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = (na * nb).sqrt();
+    if denom == 0.0 {
+        return 0.0;
+    }
+    (dot / denom) as f32
+}
+
+/// Restrict semantic neighbours to callable nodes — same set cbm uses
+/// for `SemanticallyRelated` edge emission.
+fn is_callable(kind: &latte_rs_graph::types::NodeKind) -> bool {
+    use latte_rs_graph::types::NodeKind::*;
+    matches!(
+        kind,
+        Function | Method | Class | Struct | Trait | Interface | Constructor | Route
+    )
 }
