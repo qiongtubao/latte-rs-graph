@@ -145,6 +145,21 @@ impl SqliteStorage {
             ",
         )?;
 
+        // Index-coverage honesty (Phase 12): one row per indexable file
+        // recording whether it was indexed, skipped, or failed to parse.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS index_coverage (
+                path TEXT PRIMARY KEY,
+                language TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                indexed_at INTEGER NOT NULL
+            );
+            ",
+        )?;
+
 
         // FTS5 virtual table for identifier-aware full-text search (Phase 3).
         // We pre-tokenize identifiers in Rust and store the space-joined
@@ -168,6 +183,7 @@ impl SqliteStorage {
             "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target)",
             "CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)",
             "CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime)",
+            "CREATE INDEX IF NOT EXISTS idx_coverage_status ON index_coverage(status)",
             "CREATE INDEX IF NOT EXISTS idx_ref_target_file ON `references`(target_file)",
             "CREATE INDEX IF NOT EXISTS idx_ref_target_node ON `references`(target_node)",
             "CREATE INDEX IF NOT EXISTS idx_ref_source_file ON `references`(source_file)",
@@ -177,8 +193,8 @@ impl SqliteStorage {
 
         // Step 3: Metadata
         conn.execute(
-            "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, ?2)",
-            rusqlite::params!["schema_version", "1"],
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params!["schema_version", "2"],
         )?;
 
         Ok(())
@@ -311,7 +327,8 @@ impl SqliteStorage {
         let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
         conn.execute_batch(
             "DELETE FROM nodes; DELETE FROM edges; DELETE FROM files; \
-             DELETE FROM `references`; DELETE FROM nodes_fts;"
+             DELETE FROM `references`; DELETE FROM nodes_fts; \
+             DELETE FROM index_coverage;"
         )?;
         Ok(())
     }
@@ -436,11 +453,132 @@ impl SqliteStorage {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    // =====================================================================
+    // Index coverage (Phase 12)
+    // =====================================================================
+
+    /// Record the indexing outcome for one file.
+    pub fn upsert_coverage(&self, record: &CoverageRecord) -> GraphResult<()> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO index_coverage
+             (path, language, status, reason, size_bytes, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.path,
+                record.language,
+                record.status.as_str(),
+                record.reason,
+                record.size_bytes as i64,
+                record.indexed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the coverage row for a file (e.g. it was deleted).
+    pub fn delete_coverage(&self, path: &str) -> GraphResult<()> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        conn.execute("DELETE FROM index_coverage WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// True when the `index_coverage` table exists. Databases built before
+    /// Phase 12 lack it; callers can then ask the user to rebuild.
+    pub fn has_coverage_table(&self) -> GraphResult<bool> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'index_coverage'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Build the coverage report, optionally scoped to a path prefix.
+    /// Counts cover every matching row; `entries` lists only files that
+    /// did not make it into the graph (skipped / parse_error).
+    pub fn coverage_report(&self, path_prefix: Option<&str>) -> GraphResult<CoverageReport> {
+        if !self.has_coverage_table()? {
+            return Err(GraphError::Engine(
+                "index_coverage table missing — this database predates coverage \
+                 tracking; rebuild with `lrg build` to enable it"
+                    .to_string(),
+            ));
+        }
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CoverageRecord> {
+            let status: String = row.get(2)?;
+            Ok(CoverageRecord {
+                path: row.get(0)?,
+                language: row.get(1)?,
+                status: CoverageStatus::from_str(&status),
+                reason: row.get(3)?,
+                size_bytes: row.get::<_, i64>(4)? as u64,
+                indexed_at: row.get(5)?,
+            })
+        };
+        let mut rows: Vec<CoverageRecord> = Vec::new();
+        match path_prefix {
+            Some(prefix) => {
+                let mut stmt = conn.prepare(
+                    "SELECT path, language, status, reason, size_bytes, indexed_at \
+                     FROM index_coverage WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path",
+                )?;
+                let iter = stmt.query_map(params![format!("{prefix}%")], map_row)?;
+                for row in iter {
+                    rows.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT path, language, status, reason, size_bytes, indexed_at \
+                     FROM index_coverage ORDER BY path",
+                )?;
+                let iter = stmt.query_map([], map_row)?;
+                for row in iter {
+                    rows.push(row?);
+                }
+            }
+        }
+
+        let mut report = CoverageReport {
+            path_prefix: path_prefix.map(|s| s.to_string()),
+            total_files: 0,
+            indexed: 0,
+            skipped: 0,
+            parse_errors: 0,
+            entries: Vec::new(),
+        };
+        for record in rows {
+            report.total_files += 1;
+            match record.status {
+                CoverageStatus::Indexed => report.indexed += 1,
+                CoverageStatus::Skipped => {
+                    report.skipped += 1;
+                    report.entries.push(record);
+                }
+                CoverageStatus::ParseError => {
+                    report.parse_errors += 1;
+                    report.entries.push(record);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Delete every edge of a given kind. Used to refresh derived edges
+    /// (e.g. `semantically_related`) before re-emitting them.
+    pub fn delete_edges_by_kind(&self, kind: &str) -> GraphResult<usize> {
+        let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;
+        let n = conn.execute("DELETE FROM edges WHERE kind = ?1", params![kind])?;
+        Ok(n)
+    }
+
     /// List distinct source IDs of edges pointing TO any of `node_ids`.
     /// Used after a file change to find inbound edges that need to be
     /// re-resolved (the old target went away).
-    pub fn edge_sources_pointing_to(&self, node_ids: &[String]) -> GraphResult<Vec<String>> {
-        if node_ids.is_empty() {
+    pub fn edge_sources_pointing_to(&self, node_ids: &[String]) -> GraphResult<Vec<String>> {        if node_ids.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().map_err(|e| GraphError::Engine(e.to_string()))?;

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use crate::error::{GraphError, GraphResult};
 use std::time::Instant;
@@ -61,6 +61,11 @@ fn registered_languages() -> Vec<LangConfig> {
 // TreeSitterEngine
 // =============================================================================
 
+/// Files larger than this are not parsed (5 MB). The limit is enforced in
+/// `parse_file`; the build loop checks it up front so the skip lands in
+/// the coverage table.
+pub(crate) const MAX_FILE_SIZE: usize = 5_000_000;
+
 pub struct TreeSitterEngine {
     storage: SqliteStorage,
     langs: Vec<LangConfig>,
@@ -109,7 +114,7 @@ impl TreeSitterEngine {
             message: format!("Cannot read file: {}", e),
         })?;
 
-        if content.len() > 5_000_000 {
+        if content.len() > MAX_FILE_SIZE {
             return Ok((vec![], vec![]));
         }
 
@@ -651,6 +656,10 @@ impl TreeSitterEngine {
     /// Emit the highest-scoring semantic neighbors for each indexed callable.
     fn emit_semantic_edges(&self) -> GraphResult<usize> {
         let config = SemanticConfig::default();
+        // Derived edges: drop the previous round before re-emitting, so
+        // pairs that fell below the threshold (or lost a endpoint) don't
+        // linger after incremental updates.
+        self.storage.delete_edges_by_kind("semantically_related")?;
         let mut signatures = self
             .storage
             .all_nodes()?
@@ -827,6 +836,7 @@ impl TreeSitterEngine {
                 let dropped = self.storage.delete_edges_involving(&removed_ids)?;
                 edges_rebuilt += dropped;
                 self.storage.delete_file_record(&relative)?;
+                let _ = self.storage.delete_coverage(&relative);
                 continue;
             }
 
@@ -840,6 +850,14 @@ impl TreeSitterEngine {
                 Ok(pair) => pair,
                 Err(e) => {
                     errors.push(format!("{}: {}", relative, e));
+                    let _ = self.storage.upsert_coverage(&CoverageRecord {
+                        path: relative.clone(),
+                        language: Some(lang.name.to_string()),
+                        status: CoverageStatus::ParseError,
+                        reason: Some(e.to_string()),
+                        size_bytes: std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0),
+                        indexed_at: chrono::Utc::now().timestamp(),
+                    });
                     continue;
                 }
             };
@@ -875,17 +893,19 @@ impl TreeSitterEngine {
             // Update the file record so future skip-if-unchanged logic
             // can compare mtime / hash.
             let now = chrono::Utc::now().timestamp();
-            let mtime = std::fs::metadata(&abs)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             let _ = self.storage.upsert_file(&FileRecord {
                 path: relative.clone(),
                 language: lang.name.to_string(),
-                mtime,
-                content_hash: String::new(), // hashes aren't computed yet
+                mtime: file_mtime_key(&abs),
+                content_hash: hash_file_contents(&abs).unwrap_or_default(),
+                indexed_at: now,
+            });
+            let _ = self.storage.upsert_coverage(&CoverageRecord {
+                path: relative,
+                language: Some(lang.name.to_string()),
+                status: CoverageStatus::Indexed,
+                reason: None,
+                size_bytes: std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0),
                 indexed_at: now,
             });
         }
@@ -945,6 +965,43 @@ impl GraphProvider for TreeSitterEngine {
             let files = collect_files(root, lang.extensions, &options.exclude_patterns);
 
             for file_path in &files {
+                let relative = file_path
+                    .strip_prefix(root)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                let now = chrono::Utc::now().timestamp();
+                let size_bytes = std::fs::metadata(file_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                // Files above the size limit are skipped by `parse_file`;
+                // record the gap in the coverage table so "not in the
+                // graph" is distinguishable from "not in the project".
+                // A file record is still written (with the content hash)
+                // so incremental updates don't re-hash the file forever.
+                if size_bytes > MAX_FILE_SIZE as u64 {
+                    let _ = self.storage.upsert_coverage(&CoverageRecord {
+                        path: relative.clone(),
+                        language: Some(lang.name.to_string()),
+                        status: CoverageStatus::Skipped,
+                        reason: Some(format!(
+                            "file exceeds {}MB size limit",
+                            MAX_FILE_SIZE / 1_000_000
+                        )),
+                        size_bytes,
+                        indexed_at: now,
+                    });
+                    let _ = self.storage.upsert_file(&FileRecord {
+                        path: relative,
+                        language: lang.name.to_string(),
+                        mtime: file_mtime_key(file_path),
+                        content_hash: hash_file_contents(file_path).unwrap_or_default(),
+                        indexed_at: now,
+                    });
+                    continue;
+                }
+
                 match self.parse_file(lang, file_path, root) {
                     Ok((nodes, edges)) => {
                         stats.files_scanned += 1;
@@ -968,23 +1025,22 @@ impl GraphProvider for TreeSitterEngine {
 
                         // Track the file so downstream tools (notably grep)
                         // can find the candidate set without scanning disk.
-                        let relative = file_path
-                            .strip_prefix(root)
-                            .unwrap_or(file_path)
-                            .to_string_lossy()
-                            .to_string();
-                        let now = chrono::Utc::now().timestamp();
-                        let mtime = std::fs::metadata(file_path)
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
+                        // The content hash powers skip-if-unchanged in the
+                        // incremental updater.
                         let _ = self.storage.upsert_file(&FileRecord {
-                            path: relative,
+                            path: relative.clone(),
                             language: lang.name.to_string(),
-                            mtime,
-                            content_hash: String::new(),
+                            mtime: file_mtime_key(file_path),
+                            content_hash: hash_file_contents(file_path)
+                                .unwrap_or_default(),
+                            indexed_at: now,
+                        });
+                        let _ = self.storage.upsert_coverage(&CoverageRecord {
+                            path: relative,
+                            language: Some(lang.name.to_string()),
+                            status: CoverageStatus::Indexed,
+                            reason: None,
+                            size_bytes,
                             indexed_at: now,
                         });
                     }
@@ -992,6 +1048,14 @@ impl GraphProvider for TreeSitterEngine {
                         stats
                             .errors
                             .push(format!("Parse {}: {}", file_path.display(), e));
+                        let _ = self.storage.upsert_coverage(&CoverageRecord {
+                            path: relative,
+                            language: Some(lang.name.to_string()),
+                            status: CoverageStatus::ParseError,
+                            reason: Some(e.to_string()),
+                            size_bytes,
+                            indexed_at: now,
+                        });
                     }
                 }
             }
@@ -1010,17 +1074,117 @@ impl GraphProvider for TreeSitterEngine {
         Ok(stats)
     }
 
+    /// Diff-based incremental update: walk the current tree, compare
+    /// (mtime, then FNV-1a content hash) against the `files` table, and
+    /// re-parse only what changed. Files present in the graph but gone
+    /// from disk are purged. Falls back to a full build when the database
+    /// has no baseline (empty `files` table).
     async fn update(&self, root: &Path) -> GraphResult<UpdateReport> {
-        let report = self.build(root, &BuildOptions::default()).await?;
-        Ok(UpdateReport {
-            status: UpdateStatus::Updated,
-            changed_files: report.files_scanned,
-            nodes_added: report.nodes_created,
-            nodes_removed: 0,
-            edges_rebuilt: report.edges_created,
-            duration_ms: report.duration_ms,
-            error: None,
-        })
+        let start = Instant::now();
+
+        let previous = self.storage.all_file_paths()?;
+        if previous.is_empty() {
+            let report = self.build(root, &BuildOptions::default()).await?;
+            return Ok(UpdateReport {
+                status: UpdateStatus::Updated,
+                changed_files: report.files_scanned,
+                nodes_added: report.nodes_created,
+                nodes_removed: 0,
+                edges_rebuilt: report.edges_created,
+                duration_ms: report.duration_ms,
+                error: if report.errors.is_empty() {
+                    None
+                } else {
+                    Some(report.errors.join("; "))
+                },
+            });
+        }
+
+        let options = BuildOptions::default();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut changed: Vec<PathBuf> = Vec::new();
+
+        for lang in &self.langs {
+            for file_path in collect_files(root, lang.extensions, &options.exclude_patterns) {
+                let relative = file_path
+                    .strip_prefix(root)
+                    .unwrap_or(&file_path)
+                    .to_string_lossy()
+                    .to_string();
+                // The same file can match more than one language's
+                // extension list (e.g. `.h` for c and cpp).
+                if !seen.insert(relative.clone()) {
+                    continue;
+                }
+                match self.storage.get_file_record(&relative)? {
+                    // Never indexed (or previously skipped without a
+                    // record): treat as changed.
+                    None => changed.push(file_path),
+                    Some(record) => {
+                        let mtime = file_mtime_key(&file_path);
+                        if record.mtime == mtime {
+                            continue;
+                        }
+                        let hash = hash_file_contents(&file_path)?;
+                        if hash != record.content_hash {
+                            changed.push(file_path);
+                        } else {
+                            // Same content behind an mtime bump: refresh
+                            // the record so the next update skips the hash.
+                            let _ = self.storage.upsert_file(&FileRecord {
+                                path: relative,
+                                language: record.language,
+                                mtime,
+                                content_hash: hash,
+                                indexed_at: record.indexed_at,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Files present in the graph but gone from disk. `update_files`
+        // purges paths that no longer exist.
+        for prev in previous {
+            if !seen.contains(&prev) {
+                changed.push(PathBuf::from(prev));
+            }
+        }
+
+        if changed.is_empty() {
+            return Ok(UpdateReport {
+                status: UpdateStatus::NoChanges,
+                changed_files: 0,
+                nodes_added: 0,
+                nodes_removed: 0,
+                edges_rebuilt: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+                error: None,
+            });
+        }
+
+        let mut report = self.update_files(root, &changed).await?;
+
+        // Refresh the derived semantic layer so `sem-similar` reflects the
+        // updated graph. Same O(callables²) cost a full build pays.
+        if let Err(e) = self.emit_semantic_edges() {
+            let msg = format!("semantic edges: {e}");
+            report.error = Some(match report.error {
+                Some(prev) => format!("{prev}; {msg}"),
+                None => msg,
+            });
+        }
+
+        report.duration_ms = start.elapsed().as_millis() as u64;
+        Ok(report)
+    }
+
+    async fn index_coverage(
+        &self,
+        path_prefix: Option<String>,
+    ) -> GraphResult<CoverageReport> {
+        self.storage.coverage_report(path_prefix.as_deref())
     }
 
     async fn graph_data(&self) -> GraphResult<GraphData> {
@@ -1352,10 +1516,38 @@ fn extend_exclude_with_worktrees(root: &Path, exclude: &mut Vec<String>) {
     }
 }
 
+/// File modification time as nanoseconds since the UNIX epoch (0 on
+/// error). Used purely as a change-detection key against the stored
+/// `files.mtime` — equal means "skip", different means "hash to confirm".
+fn file_mtime_key(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// FNV-1a 64-bit hash of the file contents, hex-encoded. Powers the
+/// incremental updater's change detection behind the mtime check — no
+/// external dependency, and change detection needs no cryptographic
+/// strength.
+fn hash_file_contents(path: &Path) -> GraphResult<String> {
+    let bytes = std::fs::read(path).map_err(|e| GraphError::ParseError {
+        path: path.to_path_buf(),
+        message: format!("Cannot read file for hashing: {}", e),
+    })?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in &bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 /// Collect source files under `root` with the given `extensions`, skipping
 /// hidden entries, excluded directory names, and sibling git worktrees.
-fn collect_files(root: &Path, extensions: &[&str], exclude: &[String]) -> Vec<PathBuf> {
-    let mut exclude = exclude.to_vec();
+fn collect_files(root: &Path, extensions: &[&str], exclude: &[String]) -> Vec<PathBuf> {    let mut exclude = exclude.to_vec();
     extend_exclude_with_worktrees(root, &mut exclude);
 
     WalkDir::new(root)
@@ -2005,5 +2197,128 @@ mod tests {
         // our grammar (it captures only top-level `function_item`), so this
         // is more a guard against false detection than a positive assertion.
         assert!(!nested.is_exported, "nested fn without pub must not be exported");
+    }
+
+    #[tokio::test]
+    async fn build_records_coverage_for_every_file() {
+        let (_dir, _root, engine) = bootstrap(&[
+            ("src/lib.rs", "pub fn alpha() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ])
+        .await;
+
+        let report = engine.storage.coverage_report(None).unwrap();
+        assert_eq!(report.total_files, 2);
+        assert_eq!(report.indexed, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.parse_errors, 0);
+        assert!(report.entries.is_empty(), "full coverage means no entries");
+
+        // Path-prefix scoping works.
+        let scoped = engine.storage.coverage_report(Some("src/main")).unwrap();
+        assert_eq!(scoped.total_files, 1);
+        assert_eq!(scoped.entries.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn build_marks_oversized_files_as_skipped() {
+        let big = "x".repeat(MAX_FILE_SIZE + 1);
+        let (_dir, _root, engine) = bootstrap(&[("src/big.rs", big.as_str())]).await;
+
+        let report = engine.storage.coverage_report(None).unwrap();
+        assert_eq!(report.total_files, 1);
+        assert_eq!(report.indexed, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].status, CoverageStatus::Skipped);
+        assert!(report.entries[0].reason.is_some());
+
+        // The oversized file got a file record (with hash) so incremental
+        // updates don't re-hash it on every run.
+        let record = engine
+            .storage
+            .get_file_record("src/big.rs")
+            .unwrap()
+            .expect("file record for skipped file");
+        assert!(!record.content_hash.is_empty());
+
+        // ...and no nodes were produced for it.
+        let nodes = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.file_path == "src/big.rs")
+            .count();
+        assert_eq!(nodes, 0);
+    }
+
+    #[tokio::test]
+    async fn update_reports_no_changes_when_tree_is_untouched() {
+        let (_dir, root, engine) = bootstrap(&[("src/lib.rs", "pub fn alpha() {}\n")]).await;
+
+        let report = engine.update(&root).await.unwrap();
+        assert_eq!(report.status, UpdateStatus::NoChanges);
+        assert_eq!(report.changed_files, 0);
+    }
+
+    #[tokio::test]
+    async fn update_reparses_changed_and_purges_deleted_files() {
+        let (_dir, root, engine) = bootstrap(&[
+            ("src/a.rs", "pub fn alpha() {}\n"),
+            ("src/b.rs", "pub fn beta() {}\n"),
+        ])
+        .await;
+
+        // Change b.rs (content + mtime both move), delete a.rs.
+        fs::write(root.join("src/b.rs"), "pub fn beta_v2() {}\n").unwrap();
+        fs::remove_file(root.join("src/a.rs")).unwrap();
+
+        let report = engine.update(&root).await.unwrap();
+        assert_eq!(report.status, UpdateStatus::Updated);
+        assert_eq!(report.changed_files, 2);
+
+        let names: Vec<String> = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name)
+            .collect();
+        assert!(names.contains(&"beta_v2".to_string()), "new symbol indexed");
+        assert!(!names.contains(&"beta".to_string()), "old symbol replaced");
+        assert!(!names.contains(&"alpha".to_string()), "deleted file purged");
+
+        // Coverage tracks the same reality: a.rs row is gone.
+        let coverage = engine.storage.coverage_report(None).unwrap();
+        assert_eq!(coverage.total_files, 1);
+        assert_eq!(coverage.indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn update_detects_new_files() {
+        let (_dir, root, engine) = bootstrap(&[("src/a.rs", "pub fn alpha() {}\n")]).await;
+
+        fs::write(root.join("src/c.rs"), "pub fn gamma() {}\n").unwrap();
+
+        let report = engine.update(&root).await.unwrap();
+        assert_eq!(report.status, UpdateStatus::Updated);
+        assert_eq!(report.changed_files, 1);
+
+        let names: Vec<String> = engine
+            .storage
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name)
+            .collect();
+        assert!(names.contains(&"gamma".to_string()));
+        assert!(names.contains(&"alpha".to_string()), "untouched file kept");
+
+        // A second update with no further edits is a no-op.
+        let second = engine.update(&root).await.unwrap();
+        assert_eq!(second.status, UpdateStatus::NoChanges);
     }
 }

@@ -4,9 +4,9 @@ use std::path::Path;
 use crate::error::GraphResult;
 use crate::types::{
     ArchitectureReport, ArchitectureRequest, BlastDirection, BlastRadiusReport,
-    BuildOptions, BuildReport, ComplexityMetrics, CypherRows, DeadCodeReport, GraphData,
-    GraphStats, Node, RelationResult, SearchCodeRequest, SearchCodeResponse, SearchOptions,
-    UpdateReport,
+    BuildOptions, BuildReport, ComplexityMetrics, CoverageReport, CypherRows, DeadCodeReport,
+    GraphData, GraphStats, Node, RelationResult, SearchCodeRequest, SearchCodeResponse,
+    SearchOptions, UpdateReport,
 };
 /// Core trait that every graph engine must implement.
 ///
@@ -32,6 +32,13 @@ pub trait GraphProvider: Send + Sync {
 
     /// Incrementally update the graph (e.g. after file changes).
     async fn update(&self, root: &Path) -> GraphResult<UpdateReport>;
+
+    /// Index-coverage honesty report (Phase 12): per-file indexing outcome
+    /// (indexed / skipped / parse error), optionally scoped to a path
+    /// prefix relative to the project root. Agents should consult this
+    /// before drawing conclusions from the *absence* of nodes or edges.
+    async fn index_coverage(&self, path_prefix: Option<String>)
+        -> GraphResult<CoverageReport>;
 
     // =====================================================================
     // Query

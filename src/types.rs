@@ -270,7 +270,7 @@ pub struct UpdateReport {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateStatus {
     NoChanges,
     Updated,
@@ -300,6 +300,72 @@ pub struct FileRecord {
     pub content_hash: String,
     pub mtime: i64,
     pub indexed_at: i64,
+}
+
+// =============================================================================
+// Index coverage (Phase 12)
+// =============================================================================
+//
+// Coverage tracking makes the graph *honest*: every file the indexer looked
+// at gets a row recording whether it was indexed or why it was not, so
+// downstream agents can tell "no callers exist" apart from "the file was
+// never parsed".
+
+/// Outcome of a single file during indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageStatus {
+    /// Parsed and merged into the graph.
+    Indexed,
+    /// Deliberately not parsed (e.g. exceeds the size limit).
+    Skipped,
+    /// Parse failed; `reason` carries the error message.
+    ParseError,
+}
+
+impl CoverageStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CoverageStatus::Indexed => "indexed",
+            CoverageStatus::Skipped => "skipped",
+            CoverageStatus::ParseError => "parse_error",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "skipped" => CoverageStatus::Skipped,
+            "parse_error" => CoverageStatus::ParseError,
+            _ => CoverageStatus::Indexed,
+        }
+    }
+}
+
+/// Per-file index-coverage record. Only files whose extension maps to a
+/// registered language are tracked; unsupported extensions and pruned
+/// directories (node_modules, hidden dirs, …) are out of scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageRecord {
+    pub path: String,
+    pub language: Option<String>,
+    pub status: CoverageStatus,
+    pub reason: Option<String>,
+    pub size_bytes: u64,
+    pub indexed_at: i64,
+}
+
+/// Summary + the non-indexed entries, optionally scoped to a path prefix.
+/// `entries` deliberately lists only files that did NOT make it into the
+/// graph — those are the ones an agent must know about before drawing
+/// conclusions from absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageReport {
+    pub path_prefix: Option<String>,
+    pub total_files: usize,
+    pub indexed: usize,
+    pub skipped: usize,
+    pub parse_errors: usize,
+    pub entries: Vec<CoverageRecord>,
 }
 
 /// Detection method for changes.

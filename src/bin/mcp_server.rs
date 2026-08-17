@@ -117,6 +117,7 @@ async fn handle_tools_call(params: Value) -> Result<Value, String> {
     let result = match name {
         "index_repository" => tool_index_repository(args).await,
         "list_projects" => tool_list_projects(args).await,
+        "check_index_coverage" => tool_check_index_coverage(args).await,
         "index_status" => tool_index_status(args).await,
         "search_graph" => tool_search_graph(args).await,
         "find_definitions" => tool_find_definitions(args).await,
@@ -171,7 +172,8 @@ fn tools_definitions() -> Vec<Value> {
                 "properties": {
                     "repo_path": {"type": "string", "description": "Absolute path to the project root to index."},
                     "db_path": {"type": "string", "description": "Optional output SQLite path. Defaults to <repo_path>/.latte/graph.db."},
-                    "langs": {"type": "array", "items": {"type": "string"}, "description": "Optional language whitelist (e.g. [\"rust\", \"typescript\"])."}
+                    "langs": {"type": "array", "items": {"type": "string"}, "description": "Optional language whitelist (e.g. [\"rust\", \"typescript\"])."},
+                    "incremental": {"type": "boolean", "description": "When true, re-parse only files whose content changed since the last build (mtime + content hash diff). Falls back to a full build on an empty database."}
                 },
                 "required": ["repo_path"],
             }
@@ -184,6 +186,18 @@ fn tools_definitions() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string", "description": "Directory to scan for *.db files. Defaults to ~/.cache/latte-rs-graph."}
                 }
+            }
+        }),
+        json!({
+            "name": "check_index_coverage",
+            "description": "Index-coverage honesty report: which files were indexed, skipped (e.g. size limit), or failed to parse. Consult this BEFORE concluding that a symbol, caller, or file does not exist — absence in the graph may mean the file was never indexed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "db": {"type": "string", "description": "Absolute path to the SQLite graph database."},
+                    "path": {"type": "string", "description": "Optional project-relative path prefix to scope the report."}
+                },
+                "required": ["db"]
             }
         }),
         json!({
@@ -360,6 +374,12 @@ fn opt_u32(args: &Value, key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn opt_bool(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
 fn open_readonly(db: &str) -> Result<TreeSitterEngine, String> {
     let path = Path::new(db);
     let storage = SqliteStorage::open_readonly(path).map_err(|e| e.to_string())?;
@@ -396,6 +416,16 @@ async fn tool_index_repository(args: Value) -> Result<Value, String> {
 
     let storage = SqliteStorage::open(&db_path).map_err(|e| e.to_string())?;
     let engine = TreeSitterEngine::new(storage);
+
+    if opt_bool(&args, "incremental", false) {
+        let report = engine.update(&repo).await.map_err(|e| e.to_string())?;
+        return Ok(text_content(&json!({
+            "db_path": db_path.to_string_lossy(),
+            "mode": "incremental",
+            "report": report,
+        })));
+    }
+
     let opts = BuildOptions {
         project_root: repo_path,
         languages: langs,
@@ -404,8 +434,20 @@ async fn tool_index_repository(args: Value) -> Result<Value, String> {
     let report = engine.build(&repo, &opts).await.map_err(|e| e.to_string())?;
     Ok(text_content(&json!({
         "db_path": db_path.to_string_lossy(),
+        "mode": "full",
         "report": report,
     })))
+}
+
+async fn tool_check_index_coverage(args: Value) -> Result<Value, String> {
+    let db = require_str(&args, "db")?;
+    let path = opt_str(&args, "path").map(|s| s.to_string());
+    let engine = open_readonly(db)?;
+    let report = engine
+        .index_coverage(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(text_content(&report))
 }
 
 async fn tool_list_projects(args: Value) -> Result<Value, String> {

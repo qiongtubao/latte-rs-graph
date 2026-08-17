@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+#### Index coverage honesty (Phase 12)
+- **`index_coverage` table**: every indexable file gets a row recording
+  `indexed` / `skipped` (e.g. over the 5 MB size limit) / `parse_error`
+  with a reason, so "absent from the graph" is distinguishable from
+  "absent from the project".
+- **`lrg coverage <db> [--path <prefix>] [--json]`**: human/JSON coverage
+  report — counts plus the list of files that did NOT make it into the
+  graph.
+- **MCP `check_index_coverage`**: same report over MCP, so agents can
+  verify coverage before concluding a symbol or caller does not exist.
+- Schema version bumped to 2 (additive; old databases opened writable
+  gain the new table automatically).
+
+#### Diff-based incremental indexing
+- **`TreeSitterEngine::update()` is now truly incremental**: walks the
+  tree, compares mtime then an FNV-1a content hash against the `files`
+  table, and re-parses only new/changed files while purging deleted
+  ones. Empty databases fall back to a full build; unchanged trees
+  report `NoChanges`. Derived `semantically_related` edges are refreshed
+  afterwards (previous round is deleted first, so stale pairs don't
+  linger).
+- **`files.content_hash` is now populated** (FNV-1a 64-bit, hex) by both
+  `build()` and `update_files()` — previously always empty.
+- **`lrg build --incremental`** and MCP `index_repository
+  {incremental: true}` expose the incremental path; responses carry
+  `mode: "full" | "incremental"`.
+
+---
+
 ## [0.1.0] — 2026-07-19
 
 The first public release. Single binary CLI (`lrg`) + JSON-RPC MCP server

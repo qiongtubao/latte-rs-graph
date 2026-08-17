@@ -31,6 +31,22 @@ enum Command {
         /// Languages to parse (comma-separated, default: all)
         #[arg(short, long)]
         langs: Option<String>,
+        /// Incremental update: re-parse only files whose content changed
+        /// since the last build (falls back to a full build on an empty DB)
+        #[arg(short, long)]
+        incremental: bool,
+    },
+    /// Show index coverage: which files were indexed, skipped, or failed
+    /// to parse. Consult before trusting "X does not exist" conclusions.
+    Coverage {
+        /// Path to the graph database
+        db: PathBuf,
+        /// Optional project-relative path prefix to scope the report
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Emit JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
     },
     /// Show graph statistics
     Stats {
@@ -186,7 +202,7 @@ async fn main() -> GraphResult<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { path, db, langs } => {
+        Command::Build { path, db, langs, incremental } => {
             let project_root = path.canonicalize().map_err(|e| {
                 latte_rs_graph::error::GraphError::Io(e)
             })?;
@@ -205,6 +221,29 @@ async fn main() -> GraphResult<()> {
 
             let storage = SqliteStorage::open(&db_path)?;
             let engine = TreeSitterEngine::new(storage);
+
+            if incremental {
+                let start = Instant::now();
+                let report = engine.update(&project_root).await?;
+                let elapsed = start.elapsed();
+
+                match report.status {
+                    latte_rs_graph::types::UpdateStatus::NoChanges => {
+                        println!("✅ Index already up to date ({}ms)", report.duration_ms);
+                    }
+                    _ => {
+                        println!("✅ Incremental update in {:.2}s", elapsed.as_secs_f64());
+                        println!("   Files changed:  {}", report.changed_files);
+                        println!("   Nodes added:    {}", report.nodes_added);
+                        println!("   Nodes removed:  {}", report.nodes_removed);
+                        println!("   Edges rebuilt:  {}", report.edges_rebuilt);
+                    }
+                }
+                if let Some(e) = &report.error {
+                    println!("   ⚠ {}", e);
+                }
+                return Ok(());
+            }
 
             let mut options = BuildOptions::default();
             options.project_root = project_root.to_string_lossy().to_string();
@@ -238,6 +277,43 @@ async fn main() -> GraphResult<()> {
                 println!("   Node kinds:");
                 for k in &stats.node_kinds {
                     println!("     {:>8}  {}", k.count, k.kind);
+                }
+            }
+        }
+
+        Command::Coverage { db, path, json } => {
+            let storage = SqliteStorage::open_readonly(&db)?;
+            let engine = TreeSitterEngine::new(storage);
+            let report = engine.index_coverage(path.clone()).await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+
+            println!("🧭 Index coverage for: {}", db.display());
+            if let Some(prefix) = &report.path_prefix {
+                println!("   Scope:          {}", prefix);
+            }
+            println!("   Files tracked:  {}", report.total_files);
+            println!("   Indexed:        {}", report.indexed);
+            println!("   Skipped:        {}", report.skipped);
+            println!("   Parse errors:   {}", report.parse_errors);
+            if report.entries.is_empty() {
+                println!();
+                println!("   ✅ Full coverage — every tracked file made it into the graph.");
+            } else {
+                println!();
+                println!("   ⚠ Files NOT in the graph (absence of results here is not proof of absence):");
+                for entry in &report.entries {
+                    let reason = entry.reason.as_deref().unwrap_or("-");
+                    println!(
+                        "     [{}] {} ({}, {} bytes)",
+                        entry.status.as_str(),
+                        entry.path,
+                        reason,
+                        entry.size_bytes
+                    );
                 }
             }
         }

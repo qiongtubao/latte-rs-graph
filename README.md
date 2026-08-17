@@ -9,7 +9,7 @@ day one for AI agents.**
 
 latte-rs-graph builds a queryable knowledge graph of any source tree via
 [tree-sitter](https://tree-sitter.github.io/), then exposes structural
-analysis back to agents through 13 MCP tools or 11 CLI subcommands.
+analysis back to agents through 14 MCP tools or 12 CLI subcommands.
 
 |               |                                                |
 | ------------- | ---------------------------------------------- |
@@ -55,11 +55,12 @@ Outputs are JSON when `--json` is passed, otherwise human-readable with
 
 ---
 
-## 11 CLI subcommands
+## 12 CLI subcommands
 
 | Command                                | What it does |
 | -------------------------------------- | ------------ |
-| `lrg build <path>`                     | Index a project into `<path>/.latte/graph.db` |
+| `lrg build <path>`                     | Index a project into `<path>/.latte/graph.db`; `--incremental` re-parses only changed files (mtime + content-hash diff) |
+| `lrg coverage <db> [--path p]`         | Index-coverage report: which files were indexed / skipped / failed to parse |
 | `lrg stats <db>`                       | Per-kind node / edge counts |
 | `lrg search <db> <query>`              | BM25-ranked identifier search (camelCase / snake_case aware) |
 | `lrg export <db> --limit N`            | Full graph as JSON |
@@ -74,7 +75,7 @@ Outputs are JSON when `--json` is passed, otherwise human-readable with
 
 ---
 
-## 13 MCP tools
+## 14 MCP tools
 
 Add to `~/.claude/mcp_servers.json` (or equivalent for your client):
 
@@ -91,8 +92,11 @@ Add to `~/.claude/mcp_servers.json` (or equivalent for your client):
 The `latte-mcp` binary speaks JSON-RPC 2.0 over stdio. Tool names mirror
 the CLI surface where possible:
 
-- `index_repository`
+- `index_repository` (full build by default; `incremental: true` diffs
+  mtime + content hash and re-parses only changed files)
 - `list_projects`, `index_status`
+- `check_index_coverage` — per-file indexed / skipped / parse-error
+  report; consult before trusting "X does not exist" conclusions
 - `search_graph`, `find_definitions`, `get_subgraph`
 - `query_graph` (Cypher)
 - `trace_path`
